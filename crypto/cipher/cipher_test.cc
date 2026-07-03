@@ -709,6 +709,93 @@ TEST(CipherTest, TestVectors) {
   FileTestGTest("crypto/cipher/test/cipher_tests.txt", CipherFileTest);
 }
 
+TEST(CipherTest, ChaCha20Poly1305Parameters) {
+  const EVP_CIPHER *cipher = EVP_chacha20_poly1305();
+  ASSERT_EQ(cipher, EVP_get_cipherbyname("chacha20-poly1305"));
+  ASSERT_EQ(cipher, EVP_get_cipherbynid(NID_chacha20_poly1305));
+  EXPECT_EQ(EVP_CIPHER_key_length(cipher), 32u);
+  EXPECT_EQ(EVP_CIPHER_iv_length(cipher), 12u);
+  EXPECT_EQ(EVP_CIPHER_block_size(cipher), 1u);
+
+  auto new_ctx = [&] {
+    UniquePtr<EVP_CIPHER_CTX> ctx(EVP_CIPHER_CTX_new());
+    EXPECT_TRUE(EVP_EncryptInit_ex(ctx.get(), cipher, /*engine=*/nullptr,
+                                   /*key=*/nullptr, /*iv=*/nullptr));
+    return ctx;
+  };
+
+  // RFC 8439 fixes the nonce at 96 bits.
+  for (int nonce_len : {0, 1, 8, 11, 13, 24}) {
+    SCOPED_TRACE(nonce_len);
+    UniquePtr<EVP_CIPHER_CTX> ctx = new_ctx();
+    EXPECT_FALSE(EVP_CIPHER_CTX_ctrl(ctx.get(), EVP_CTRL_AEAD_SET_IVLEN,
+                                     nonce_len, nullptr));
+    ERR_clear_error();
+  }
+  UniquePtr<EVP_CIPHER_CTX> ctx = new_ctx();
+  ASSERT_TRUE(EVP_CIPHER_CTX_ctrl(ctx.get(), EVP_CTRL_AEAD_SET_IVLEN, 12,
+                                  nullptr));
+  int ivlen = 0;
+  ASSERT_TRUE(EVP_CIPHER_CTX_ctrl(ctx.get(), EVP_CTRL_GET_IVLEN, 0, &ivlen));
+  EXPECT_EQ(ivlen, 12);
+
+  // The tag is at most 16 bytes, and cannot be supplied when encrypting.
+  for (int tag_len : {0, 17, 32}) {
+    SCOPED_TRACE(tag_len);
+    EXPECT_FALSE(EVP_CIPHER_CTX_ctrl(ctx.get(), EVP_CTRL_AEAD_SET_TAG, tag_len,
+                                     nullptr));
+    ERR_clear_error();
+  }
+  ASSERT_TRUE(EVP_CIPHER_CTX_ctrl(ctx.get(), EVP_CTRL_AEAD_SET_TAG, 12,
+                                  nullptr));
+  uint8_t tag[16] = {0};
+  EXPECT_FALSE(EVP_CIPHER_CTX_ctrl(ctx.get(), EVP_CTRL_AEAD_SET_TAG, 16, tag));
+  ERR_clear_error();
+
+  // Only a 32-byte key is accepted.
+  for (unsigned key_len : {16u, 24u, 31u, 33u}) {
+    SCOPED_TRACE(key_len);
+    EXPECT_FALSE(EVP_CIPHER_CTX_set_key_length(ctx.get(), key_len));
+    ERR_clear_error();
+  }
+  EXPECT_TRUE(EVP_CIPHER_CTX_set_key_length(ctx.get(), 32));
+}
+
+// Decrypting without supplying a tag must fail rather than release
+// unauthenticated plaintext.
+TEST(CipherTest, ChaCha20Poly1305DecryptWithoutTag) {
+  uint8_t key[32] = {0}, nonce[12] = {0};
+  UniquePtr<EVP_CIPHER_CTX> ctx(EVP_CIPHER_CTX_new());
+  ASSERT_TRUE(EVP_DecryptInit_ex(ctx.get(), EVP_chacha20_poly1305(),
+                                 /*engine=*/nullptr, key, nonce));
+
+  uint8_t out[8];
+  int out_len;
+  const uint8_t ciphertext[8] = {0};
+  ASSERT_TRUE(EVP_DecryptUpdate(ctx.get(), out, &out_len, ciphertext,
+                                sizeof(ciphertext)));
+  EXPECT_EQ(out_len, static_cast<int>(sizeof(ciphertext)));
+  EXPECT_FALSE(EVP_DecryptFinal_ex(ctx.get(), out, &out_len));
+  ERR_clear_error();
+}
+
+// Additional data must precede the ciphertext, as RFC 8439 hashes it first.
+TEST(CipherTest, ChaCha20Poly1305AADAfterCiphertext) {
+  uint8_t key[32] = {0}, nonce[12] = {0};
+  UniquePtr<EVP_CIPHER_CTX> ctx(EVP_CIPHER_CTX_new());
+  ASSERT_TRUE(EVP_EncryptInit_ex(ctx.get(), EVP_chacha20_poly1305(),
+                                 /*engine=*/nullptr, key, nonce));
+
+  uint8_t out[8];
+  int out_len;
+  const uint8_t plaintext[8] = {0};
+  ASSERT_TRUE(EVP_EncryptUpdate(ctx.get(), out, &out_len, plaintext,
+                                sizeof(plaintext)));
+  const uint8_t aad[4] = {0};
+  EXPECT_FALSE(EVP_CipherUpdateAAD(ctx.get(), aad, sizeof(aad)));
+  ERR_clear_error();
+}
+
 TEST(CipherTest, CAVP_AES_128_CBC) {
   FileTestGTest("crypto/cipher/test/nist_cavp/aes_128_cbc.txt", CipherFileTest);
 }

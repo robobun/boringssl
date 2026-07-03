@@ -440,7 +440,6 @@ struct cipher_chacha20_poly1305_ctx {
   uint32_t counter;
   uint64_t aad_len;
   uint64_t text_len;
-  unsigned nonce_len;
   unsigned tag_len;
   bool key_set;
   bool nonce_set;
@@ -504,8 +503,8 @@ int cipher_chacha20_poly1305_init_key(EVP_CIPHER_CTX *ctx, const uint8_t *key,
     return 1;
   }
 
-  // A new key or nonce begins a new message. The tag, nonce length and tag
-  // length are configured separately and deliberately survive this.
+  // A new key or nonce begins a new message. The tag and tag length are
+  // configured separately and deliberately survive this.
   c->aad_len = 0;
   c->text_len = 0;
   c->counter = 1;
@@ -519,11 +518,7 @@ int cipher_chacha20_poly1305_init_key(EVP_CIPHER_CTX *ctx, const uint8_t *key,
   }
 
   if (iv != nullptr) {
-    // Nonces shorter than 12 bytes are padded on the left with zeros, matching
-    // OpenSSL.
-    OPENSSL_memset(c->nonce, 0, sizeof(c->nonce));
-    OPENSSL_memcpy(c->nonce + sizeof(c->nonce) - c->nonce_len, iv,
-                   c->nonce_len);
+    OPENSSL_memcpy(c->nonce, iv, sizeof(c->nonce));
     c->nonce_set = true;
   }
 
@@ -661,22 +656,21 @@ int cipher_chacha20_poly1305_ctrl(EVP_CIPHER_CTX *ctx, int type, int arg,
   switch (type) {
     case EVP_CTRL_INIT:
       OPENSSL_memset(c, 0, sizeof(*c));
-      c->nonce_len = CHACHA20_POLY1305_NONCE_LEN;
       c->tag_len = POLY1305_TAG_LEN;
       c->keystream_used = CHACHA20_POLY1305_BLOCK_LEN;
       c->counter = 1;
       return 1;
 
     case EVP_CTRL_GET_IVLEN:
-      *reinterpret_cast<int *>(ptr) = static_cast<int>(c->nonce_len);
+      *reinterpret_cast<int *>(ptr) = CHACHA20_POLY1305_NONCE_LEN;
       return 1;
 
     case EVP_CTRL_AEAD_SET_IVLEN:
-      if (arg <= 0 || arg > CHACHA20_POLY1305_NONCE_LEN) {
+      // RFC 8439 fixes the nonce at 96 bits.
+      if (arg != CHACHA20_POLY1305_NONCE_LEN) {
         OPENSSL_PUT_ERROR(CIPHER, CIPHER_R_INVALID_NONCE_SIZE);
         return 0;
       }
-      c->nonce_len = static_cast<unsigned>(arg);
       return 1;
 
     case EVP_CTRL_AEAD_SET_TAG:
