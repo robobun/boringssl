@@ -776,7 +776,9 @@ TEST(CipherTest, ChaCha20Poly1305DecryptWithoutTag) {
                                 sizeof(ciphertext)));
   EXPECT_EQ(out_len, static_cast<int>(sizeof(ciphertext)));
   EXPECT_FALSE(EVP_DecryptFinal_ex(ctx.get(), out, &out_len));
-  ERR_clear_error();
+  // An authentication failure leaves the error queue clean, so that callers can
+  // tell it apart from an internal error.
+  EXPECT_EQ(ERR_peek_error(), 0u);
 }
 
 // Additional data must precede the ciphertext, as RFC 8439 hashes it first.

@@ -613,13 +613,13 @@ int cipher_chacha20_poly1305_update(EVP_CIPHER_CTX *ctx, uint8_t *out,
 
 int cipher_chacha20_poly1305_final(EVP_CIPHER_CTX *ctx) {
   cipher_chacha20_poly1305_ctx *c = cipher_chacha20_poly1305_data(ctx);
+  // A failed authentication leaves the error queue untouched, as `aes_gcm` does,
+  // so that callers can tell it apart from an internal error.
   if (!c->key_set || !c->nonce_set) {
-    OPENSSL_PUT_ERROR(CIPHER, CIPHER_R_INPUT_NOT_INITIALIZED);
     return 0;
   }
   if (!ctx->encrypt && !c->tag_set) {
     // Nothing to authenticate the ciphertext against.
-    OPENSSL_PUT_ERROR(CIPHER, CIPHER_R_BAD_DECRYPT);
     return 0;
   }
 
@@ -635,7 +635,6 @@ int cipher_chacha20_poly1305_final(EVP_CIPHER_CTX *ctx) {
 
   if (!ctx->encrypt) {
     if (CRYPTO_memcmp(tag, c->tag, c->tag_len) != 0) {
-      OPENSSL_PUT_ERROR(CIPHER, CIPHER_R_BAD_DECRYPT);
       return 0;
     }
   } else {
