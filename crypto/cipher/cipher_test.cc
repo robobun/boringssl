@@ -86,8 +86,18 @@ static const EVP_CIPHER *GetCipher(const std::string &name) {
     return EVP_aes_256_gcm();
   } else if (name == "AES-256-OFB") {
     return EVP_aes_256_ofb();
+  } else if (name == "ChaCha20-Poly1305") {
+    return EVP_chacha20_poly1305();
   }
   return nullptr;
+}
+
+// IsAEAD returns whether `cipher` is one of the deprecated AEADs exposed through
+// the `EVP_CIPHER` interface, which take additional data and produce an
+// authentication tag.
+static bool IsAEAD(const EVP_CIPHER *cipher) {
+  return EVP_CIPHER_mode(cipher) == EVP_CIPH_GCM_MODE ||
+         EVP_CIPHER_nid(cipher) == NID_chacha20_poly1305;
 }
 
 enum class Operation {
@@ -168,7 +178,7 @@ static void TestCipherAPI(const EVP_CIPHER *cipher, Operation op, bool padding,
       EVP_CIPHER_flags(cipher) & EVP_CIPH_FLAG_CUSTOM_CIPHER;
   Span<const uint8_t> in = encrypt ? plaintext : ciphertext;
   Span<const uint8_t> expected = encrypt ? ciphertext : plaintext;
-  bool is_aead = EVP_CIPHER_mode(cipher) == EVP_CIPH_GCM_MODE;
+  bool is_aead = IsAEAD(cipher);
 
   // Some `EVP_CIPHER`s take a variable-length key, and need to first be
   // configured with the key length, which requires configuring the cipher.
@@ -483,7 +493,7 @@ static void TestSizedAPIRangeChecks(const EVP_CIPHER *cipher, Operation op,
   bool encrypt = op == Operation::kEncrypt;
   Span<const uint8_t> in = encrypt ? plaintext : ciphertext;
   Span<const uint8_t> expected = encrypt ? ciphertext : plaintext;
-  bool is_aead = EVP_CIPHER_mode(cipher) == EVP_CIPH_GCM_MODE;
+  bool is_aead = IsAEAD(cipher);
 
   // Some `EVP_CIPHER`s take a variable-length key, and need to first be
   // configured with the key length, which requires configuring the cipher.
@@ -672,7 +682,7 @@ static void CipherFileTest(FileTest *t) {
   if (EVP_CIPHER_iv_length(cipher) > 0) {
     ASSERT_TRUE(t->GetBytes(&iv, "IV"));
   }
-  if (EVP_CIPHER_mode(cipher) == EVP_CIPH_GCM_MODE) {
+  if (IsAEAD(cipher)) {
     ASSERT_TRUE(t->GetBytes(&aad, "AAD"));
     ASSERT_TRUE(t->GetBytes(&tag, "Tag"));
   }
