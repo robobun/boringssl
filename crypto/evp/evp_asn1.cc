@@ -115,13 +115,9 @@ EVP_PKEY *EVP_PKEY_from_private_key_info(const uint8_t *in, size_t len,
     return nullptr;
   }
 
-  // Skip the optional attributes [0] and publicKey [1] fields. The publicKey
-  // field is only valid in a v2 OneAsymmetricKey and must be a well-formed BIT
-  // STRING body; its contents are otherwise ignored. Attribute contents remain
-  // unvalidated on this path, as they always were. The trailing-data check
-  // rejects duplicate, reordered, or unknown fields and matches the
-  // `PKCS8_PRIV_KEY_INFO` template and OpenSSL, neither of which honours the
-  // RFC 5958 extension marker.
+  // Skip optional attributes [0] and publicKey [1]; [1] requires v2 and a valid
+  // BIT STRING body. Nothing may follow (matches the template path and OpenSSL,
+  // neither of which honours the RFC 5958 extension marker).
   CBS pub;
   int has_pub;
   if (!CBS_get_optional_asn1(
