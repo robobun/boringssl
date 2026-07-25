@@ -1098,43 +1098,64 @@ TEST(EVPExtraTest, Ed25519OneAsymmetricKeyV2) {
   EXPECT_EQ(Bytes(der, der_len), Bytes(kV2PrivateKey));
   OPENSSL_free(der);
 
-  // The publicKey [1] field requires v2.
-  static const uint8_t kV1WithPublicKey[] = {
-      0x30, 0x51, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70,
-      0x04, 0x22, 0x04, 0x20, 0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60,
-      0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec, 0x2c, 0xc4, 0x44, 0x49, 0xc5, 0x69,
-      0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b, 0xac, 0x03, 0x1c, 0xae, 0x7f, 0x60,
-      0x81, 0x21, 0x00, 0xd7, 0x5a, 0x98, 0x01, 0x82, 0xb1, 0x0a, 0xb7, 0xd5,
-      0x4b, 0xfe, 0xd3, 0xc9, 0x64, 0x07, 0x3a, 0x0e, 0xe1, 0x72, 0xf3, 0xda,
-      0xa6, 0x23, 0x25, 0xaf, 0x02, 0x1a, 0x68, 0xf7, 0x07, 0x51, 0x1a,
+  // Invalid encodings are rejected on both paths. Each vector is built from a
+  // common prefix (SEQUENCE header, version, AlgorithmIdentifier, private key)
+  // with the outer length and version byte patched, followed by the trailing
+  // bytes after the privateKey OCTET STRING.
+  const auto build = [&](uint8_t version, Span<const uint8_t> tail) {
+    std::vector<uint8_t> out = {
+        0x30, 0x00, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06,
+        0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20,
+    };
+    out.insert(out.end(), std::begin(kPrivateKeySeed),
+               std::end(kPrivateKeySeed));
+    out.insert(out.end(), tail.begin(), tail.end());
+    out[1] = static_cast<uint8_t>(out.size() - 2);
+    out[4] = version;
+    return out;
   };
-  CBS_init(&cbs, kV1WithPublicKey, sizeof(kV1WithPublicKey));
-  EXPECT_FALSE(EVP_parse_private_key(&cbs));
-  ERR_clear_error();
-  ptr = kV1WithPublicKey;
-  EXPECT_FALSE(
-      d2i_PKCS8_PRIV_KEY_INFO(nullptr, &ptr, sizeof(kV1WithPublicKey)));
-  ERR_clear_error();
-
-  // Versions above v2 are rejected.
-  static const uint8_t kV3PrivateKey[] = {
-      0x30, 0x53, 0x02, 0x01, 0x02, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70,
-      0x04, 0x22, 0x04, 0x20, 0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60,
-      0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec, 0x2c, 0xc4, 0x44, 0x49, 0xc5, 0x69,
-      0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b, 0xac, 0x03, 0x1c, 0xae, 0x7f, 0x60,
-      0xa0, 0x00, 0x81, 0x21, 0x00, 0xd7, 0x5a, 0x98, 0x01, 0x82, 0xb1, 0x0a,
-      0xb7, 0xd5, 0x4b, 0xfe, 0xd3, 0xc9, 0x64, 0x07, 0x3a, 0x0e, 0xe1, 0x72,
-      0xf3, 0xda, 0xa6, 0x23, 0x25, 0xaf, 0x02, 0x1a, 0x68, 0xf7, 0x07, 0x51,
-      0x1a,
+  static const uint8_t kPub[] = {0x81, 0x21, 0x00, 0xd7, 0x5a, 0x98, 0x01,
+                                 0x82, 0xb1, 0x0a, 0xb7, 0xd5, 0x4b, 0xfe,
+                                 0xd3, 0xc9, 0x64, 0x07, 0x3a, 0x0e, 0xe1,
+                                 0x72, 0xf3, 0xda, 0xa6, 0x23, 0x25, 0xaf,
+                                 0x02, 0x1a, 0x68, 0xf7, 0x07, 0x51, 0x1a};
+  static const uint8_t kEmptyPub[] = {0x81, 0x00};
+  static const uint8_t kBadPaddingPub[] = {0x81, 0x01, 0x08};
+  static const uint8_t kAttrsThenPubTwice[] = {0xa0, 0x00, 0x81, 0x01,
+                                               0x00, 0x81, 0x01, 0x00};
+  static const uint8_t kPubThenAttrs[] = {0x81, 0x01, 0x00, 0xa0, 0x00};
+  static const uint8_t kAttrsPubExt[] = {0xa0, 0x00, 0x81, 0x01,
+                                         0x00, 0x82, 0x01, 0x00};
+  const struct {
+    const char *name;
+    std::vector<uint8_t> der;
+  } kInvalid[] = {
+      // The publicKey [1] field requires v2.
+      {"v1-with-pub", build(0, kPub)},
+      // Versions above v2 are rejected.
+      {"version-2", build(2, kPub)},
+      // publicKey [1] is an IMPLICIT BIT STRING and must carry at least the
+      // leading unused-bits octet, which must be at most 7.
+      {"empty-bitstring", build(1, kEmptyPub)},
+      {"bad-bitstring-padding", build(1, kBadPaddingPub)},
+      // Trailing, duplicate, reordered, or unknown fields after the defined
+      // optional fields are rejected. The `PKCS8_PRIV_KEY_INFO` template and
+      // OpenSSL do not honour the RFC 5958 extension marker, so neither do we.
+      {"duplicate-pub", build(1, kAttrsThenPubTwice)},
+      {"reordered", build(1, kPubThenAttrs)},
+      {"unknown-extension", build(1, kAttrsPubExt)},
   };
-  CBS_init(&cbs, kV3PrivateKey, sizeof(kV3PrivateKey));
-  EXPECT_FALSE(EVP_parse_private_key(&cbs));
-  ERR_clear_error();
-  ptr = kV3PrivateKey;
-  EXPECT_FALSE(d2i_PKCS8_PRIV_KEY_INFO(nullptr, &ptr, sizeof(kV3PrivateKey)));
-  ERR_clear_error();
+  for (const auto &t : kInvalid) {
+    SCOPED_TRACE(t.name);
+    CBS_init(&cbs, t.der.data(), t.der.size());
+    EXPECT_FALSE(EVP_parse_private_key(&cbs));
+    ERR_clear_error();
+    ptr = t.der.data();
+    EXPECT_FALSE(
+        d2i_PKCS8_PRIV_KEY_INFO(nullptr, &ptr, static_cast<long>(t.der.size())));
+    ERR_clear_error();
+  }
 }
-
 
 static void ExpectRSAKey(const EVP_PKEY *pkey, int bits, uint64_t e) {
   ASSERT_EQ(EVP_PKEY_id(pkey), EVP_PKEY_RSA);
