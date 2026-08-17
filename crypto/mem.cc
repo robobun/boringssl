@@ -483,10 +483,12 @@ int BIO_vsnprintf(char *buf, size_t n, const char *format, va_list args) {
 
 int bssl::OPENSSL_vasprintf_internal(char **str, const char *format,
                                      va_list args, int system_malloc) {
-  void *(*allocate)(size_t) = system_malloc ? malloc : OPENSSL_malloc;
-  void (*deallocate)(void *) = system_malloc ? free : OPENSSL_free;
+  void *(*allocate)(size_t) =
+      system_malloc ? OPENSSL_system_malloc : OPENSSL_malloc;
+  void (*deallocate)(void *) =
+      system_malloc ? OPENSSL_system_free : OPENSSL_free;
   void *(*reallocate)(void *, size_t) =
-      system_malloc ? realloc : OPENSSL_realloc;
+      system_malloc ? OPENSSL_system_realloc : OPENSSL_realloc;
   char *candidate = nullptr;
   size_t candidate_len = 64;  // TODO(bbe) what's the best initial size?
   int ret;

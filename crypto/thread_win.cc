@@ -88,7 +88,7 @@ static void NTAPI thread_local_destructor(PVOID module, DWORD reason,
     }
   }
 
-  free(pointers);
+  OPENSSL_system_free(pointers);
 }
 
 // Thread Termination Callbacks.
@@ -201,14 +201,14 @@ int CRYPTO_set_thread_local(thread_local_data_t index, void *value,
   void **pointers = get_thread_locals();
   if (pointers == nullptr) {
     pointers = reinterpret_cast<void **>(
-        malloc(sizeof(void *) * NUM_OPENSSL_THREAD_LOCALS));
+        OPENSSL_system_malloc(sizeof(void *) * NUM_OPENSSL_THREAD_LOCALS));
     if (pointers == nullptr) {
       destructor(value);
       return 0;
     }
     OPENSSL_memset(pointers, 0, sizeof(void *) * NUM_OPENSSL_THREAD_LOCALS);
     if (TlsSetValue(g_thread_local_key, pointers) == 0) {
-      free(pointers);
+      OPENSSL_system_free(pointers);
       destructor(value);
       return 0;
     }

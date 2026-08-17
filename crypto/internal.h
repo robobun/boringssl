@@ -165,6 +165,26 @@ inline void OPENSSL_disable_malloc_failures_for_testing() {}
 inline void OPENSSL_enable_malloc_failures_for_testing() {}
 #endif
 
+// OPENSSL_system_malloc, OPENSSL_system_realloc and OPENSSL_system_free back
+// the few allocations that deliberately bypass |OPENSSL_malloc|: the TLS record
+// buffers (not worth zeroing on free), the error queue (|OPENSSL_malloc|
+// reports its failures into it) and the per-thread tables behind
+// |CRYPTO_set_thread_local|. Unlike |OPENSSL_free|, freeing does not zero.
+#if defined(BORINGSSL_REQUIRE_MEMORY_HOOKS)
+// Bun: supplied by the embedder alongside |OPENSSL_memory_alloc| (see mem.cc),
+// so that this memory also lands on the embedder's allocator on platforms where
+// the C runtime's malloc is not overridden globally (Windows, macOS).
+extern "C" void *OPENSSL_system_malloc(size_t size);
+extern "C" void *OPENSSL_system_realloc(void *ptr, size_t size);
+extern "C" void OPENSSL_system_free(void *ptr);
+#else
+inline void *OPENSSL_system_malloc(size_t size) { return malloc(size); }
+inline void *OPENSSL_system_realloc(void *ptr, size_t size) {
+  return realloc(ptr, size);
+}
+inline void OPENSSL_system_free(void *ptr) { free(ptr); }
+#endif
+
 #if defined(__has_builtin)
 #define OPENSSL_HAS_BUILTIN(x) __has_builtin(x)
 #else
@@ -1450,8 +1470,8 @@ extern "C" uint8_t BORINGSSL_function_hit[8];
 
 // OPENSSL_vasprintf_internal is just like `vasprintf(3)`. If `system_malloc` is
 // 0, memory will be allocated with `OPENSSL_malloc` and must be freed with
-// `OPENSSL_free`. Otherwise the system `malloc` function is used and the memory
-// must be freed with the system `free` function.
+// `OPENSSL_free`. Otherwise `OPENSSL_system_malloc` is used and the memory must
+// be freed with `OPENSSL_system_free`.
 OPENSSL_EXPORT int OPENSSL_vasprintf_internal(char **str, const char *format,
                                               va_list args, int system_malloc)
     OPENSSL_PRINTF_FORMAT_FUNC(2, 0);

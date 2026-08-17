@@ -75,11 +75,11 @@ extern const char kOpenSSLReasonStringData[];
 
 BSSL_NAMESPACE_END
 
-static char *strdup_libc_malloc(const char *str) {
+static char *strdup_system_malloc(const char *str) {
   // `strdup` is not in C until C23, so MSVC triggers deprecation warnings, and
   // glibc and musl gate it on a feature macro. Reimplementing it is easier.
   size_t len = strlen(str);
-  char *ret = reinterpret_cast<char *>(malloc(len + 1));
+  char *ret = reinterpret_cast<char *>(OPENSSL_system_malloc(len + 1));
   if (ret != nullptr) {
     memcpy(ret, str, len + 1);
   }
@@ -88,7 +88,7 @@ static char *strdup_libc_malloc(const char *str) {
 
 // err_clear clears the given queued error.
 static void err_clear(struct err_error_st *error) {
-  free(error->data);
+  OPENSSL_system_free(error->data);
   OPENSSL_memset(error, 0, sizeof(struct err_error_st));
 }
 
@@ -98,7 +98,7 @@ static void err_copy(struct err_error_st *dst, const struct err_error_st *src) {
   if (src->data != nullptr) {
     // We can't use OPENSSL_strdup because we don't want to call OPENSSL_malloc,
     // which can affect the error stack.
-    dst->data = strdup_libc_malloc(src->data);
+    dst->data = strdup_system_malloc(src->data);
   }
   dst->packed = src->packed;
   dst->line = src->line;
@@ -122,8 +122,8 @@ static void err_state_free(void *statep) {
   for (unsigned i = 0; i < ERR_NUM_ERRORS; i++) {
     err_clear(&state->errors[i]);
   }
-  free(state->to_free);
-  free(state);
+  OPENSSL_system_free(state->to_free);
+  OPENSSL_system_free(state);
 }
 
 // err_get_state gets the ERR_STATE object for the current thread.
@@ -131,7 +131,8 @@ static ERR_STATE *err_get_state() {
   ERR_STATE *state = reinterpret_cast<ERR_STATE *>(
       CRYPTO_get_thread_local(OPENSSL_THREAD_LOCAL_ERR));
   if (state == nullptr) {
-    state = reinterpret_cast<ERR_STATE *>(malloc(sizeof(ERR_STATE)));
+    state = reinterpret_cast<ERR_STATE *>(
+        OPENSSL_system_malloc(sizeof(ERR_STATE)));
     if (state == nullptr) {
       return nullptr;
     }
@@ -199,7 +200,7 @@ static uint32_t get_error_values(int inc, int top, const char **file, int *line,
       // error queue.
       if (inc) {
         if (error->data != nullptr) {
-          free(state->to_free);
+          OPENSSL_system_free(state->to_free);
           state->to_free = error->data;
         }
         error->data = nullptr;
@@ -273,7 +274,7 @@ void ERR_clear_error() {
   for (i = 0; i < ERR_NUM_ERRORS; i++) {
     err_clear(&state->errors[i]);
   }
-  free(state->to_free);
+  OPENSSL_system_free(state->to_free);
   state->to_free = nullptr;
 
   state->top = state->bottom = 0;
@@ -577,13 +578,13 @@ static void err_set_error_data(char *data) {
   struct err_error_st *error;
 
   if (state == nullptr || state->top == state->bottom) {
-    free(data);
+    OPENSSL_system_free(data);
     return;
   }
 
   error = &state->errors[state->top];
 
-  free(error->data);
+  OPENSSL_system_free(error->data);
   error->data = data;
 }
 
@@ -642,7 +643,8 @@ static void err_add_error_vdata(unsigned num, va_list args) {
     return;  // Would overflow.
   }
   total_size += 1;  // NUL terminator.
-  if ((buf = reinterpret_cast<char *>(malloc(total_size))) == nullptr) {
+  buf = reinterpret_cast<char *>(OPENSSL_system_malloc(total_size));
+  if (buf == nullptr) {
     return;
   }
   buf[0] = '\0';
@@ -686,7 +688,7 @@ void ERR_set_error_data(char *data, int flags) {
   }
   // We can not use OPENSSL_strdup because we don't want to call OPENSSL_malloc,
   // which can affect the error stack.
-  char *copy = strdup_libc_malloc(data);
+  char *copy = strdup_system_malloc(data);
   if (copy != nullptr) {
     err_set_error_data(copy);
   }
@@ -759,8 +761,8 @@ void bssl::ERR_SAVE_STATE_free(ERR_SAVE_STATE *state) {
   for (size_t i = 0; i < state->num_errors; i++) {
     err_clear(&state->errors[i]);
   }
-  free(state->errors);
-  free(state);
+  OPENSSL_system_free(state->errors);
+  OPENSSL_system_free(state);
 }
 
 ERR_SAVE_STATE *bssl::ERR_save_state() {
@@ -769,8 +771,8 @@ ERR_SAVE_STATE *bssl::ERR_save_state() {
     return nullptr;
   }
 
-  ERR_SAVE_STATE *ret =
-      reinterpret_cast<ERR_SAVE_STATE *>(malloc(sizeof(ERR_SAVE_STATE)));
+  ERR_SAVE_STATE *ret = reinterpret_cast<ERR_SAVE_STATE *>(
+      OPENSSL_system_malloc(sizeof(ERR_SAVE_STATE)));
   if (ret == nullptr) {
     return nullptr;
   }
@@ -781,9 +783,9 @@ ERR_SAVE_STATE *bssl::ERR_save_state() {
                           : ERR_NUM_ERRORS + state->top - state->bottom;
   assert(num_errors < ERR_NUM_ERRORS);
   ret->errors = reinterpret_cast<err_error_st *>(
-      malloc(num_errors * sizeof(struct err_error_st)));
+      OPENSSL_system_malloc(num_errors * sizeof(struct err_error_st)));
   if (ret->errors == nullptr) {
-    free(ret);
+    OPENSSL_system_free(ret);
     return nullptr;
   }
   OPENSSL_memset(ret->errors, 0, num_errors * sizeof(struct err_error_st));
