@@ -71,7 +71,7 @@ static void thread_local_destructor(void *arg) {
     }
   }
 
-  free(pointers);
+  OPENSSL_system_free(pointers);
 }
 
 static pthread_once_t g_thread_local_init_once = PTHREAD_ONCE_INIT;
@@ -109,14 +109,14 @@ int CRYPTO_set_thread_local(thread_local_data_t index, void *value,
       reinterpret_cast<void **>(pthread_getspecific(g_thread_local_key));
   if (pointers == nullptr) {
     pointers = reinterpret_cast<void **>(
-        malloc(sizeof(void *) * NUM_OPENSSL_THREAD_LOCALS));
+        OPENSSL_system_malloc(sizeof(void *) * NUM_OPENSSL_THREAD_LOCALS));
     if (pointers == nullptr) {
       destructor(value);
       return 0;
     }
     OPENSSL_memset(pointers, 0, sizeof(void *) * NUM_OPENSSL_THREAD_LOCALS);
     if (pthread_setspecific(g_thread_local_key, pointers) != 0) {
-      free(pointers);
+      OPENSSL_system_free(pointers);
       destructor(value);
       return 0;
     }
