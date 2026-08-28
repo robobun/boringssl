@@ -25,6 +25,48 @@
 
 #include "../test/test_util.h"
 
+#if defined(BORINGSSL_PEM_FAST_PUBLIC_BASE64)
+#include <openssl/base64.h>
+
+// A reference implementation of the embedder hooks in terms of the
+// constant-time routines, recording which path was taken, so this suite can
+// check that public labels are routed to the hooks, private ones are not, and
+// the output is unchanged either way.
+static int g_public_decodes = 0, g_public_encodes = 0;
+
+int OPENSSL_pem_public_base64_decode(uint8_t *out, size_t *out_len,
+                                     size_t max_out, const uint8_t *in,
+                                     size_t in_len) {
+  g_public_decodes++;
+  std::vector<uint8_t> stripped;
+  for (size_t i = 0; i < in_len; i++) {
+    if (!OPENSSL_isspace(in[i])) {
+      stripped.push_back(in[i]);
+    }
+  }
+  return EVP_DecodeBase64(out, out_len, max_out, stripped.data(),
+                          stripped.size());
+}
+
+size_t OPENSSL_pem_public_base64_encode(char *out, size_t max_out,
+                                        const uint8_t *in, size_t in_len) {
+  g_public_encodes++;
+  size_t written = 0;
+  while (in_len > 0) {
+    size_t n = in_len > 48 ? 48 : in_len;
+    // EVP_EncodeBlock also writes a NUL, which the newline then replaces.
+    if (written + (n + 2) / 3 * 4 + 1 > max_out) {
+      return 0;
+    }
+    written += EVP_EncodeBlock(reinterpret_cast<uint8_t *>(out + written), in, n);
+    out[written++] = '\n';
+    in += n;
+    in_len -= n;
+  }
+  return written;
+}
+#endif
+
 
 namespace {
 
@@ -555,3 +597,86 @@ Rvvdqakendy6WgHn1peoChj5w8SjHlbifINI2xYaHPUdfvGULUvPciLB
 }
 
 }  // namespace
+
+// Round-trip PEM blocks of assorted sizes under public and private labels. When
+// built with BORINGSSL_PEM_FAST_PUBLIC_BASE64, public labels must go through
+// the embedder hooks and private labels must not; either way the encoding must
+// be byte-for-byte what the constant-time path produces.
+TEST(PEMTest, PublicBase64HookRoundTrip) {
+  for (size_t len : {0, 1, 2, 3, 47, 48, 49, 64, 100, 1000, 4096, 5000}) {
+    SCOPED_TRACE(len);
+    std::vector<uint8_t> data(len);
+    for (size_t i = 0; i < len; i++) {
+      data[i] = static_cast<uint8_t>(i * 7 + len);
+    }
+    // The expected body, from the constant-time encoder.
+    std::string expected_body;
+    if (len > 0) {
+      size_t max;
+      ASSERT_TRUE(EVP_EncodedLength(&max, len));
+      std::vector<uint8_t> tmp(max + max / 64 + 2);
+      EVP_ENCODE_CTX ctx;
+      int n = 0, total = 0;
+      EVP_EncodeInit(&ctx);
+      EVP_EncodeUpdate(&ctx, tmp.data(), &n, data.data(), len);
+      total += n;
+      EVP_EncodeFinal(&ctx, tmp.data() + total, &n);
+      total += n;
+      expected_body.assign(reinterpret_cast<char *>(tmp.data()), total);
+    }
+    for (const char *label : {"CERTIFICATE", "X509 CRL", "PUBLIC KEY",
+                              "RSA PRIVATE KEY", "PRIVATE KEY",
+                              "SSL SESSION PARAMETERS"}) {
+      SCOPED_TRACE(label);
+#if defined(BORINGSSL_PEM_FAST_PUBLIC_BASE64)
+      int decodes_before = g_public_decodes, encodes_before = g_public_encodes;
+      bool is_public = strstr(label, "PRIVATE") == nullptr &&
+                       strstr(label, "SESSION") == nullptr;
+#endif
+      bssl::UniquePtr<BIO> bio(BIO_new(BIO_s_mem()));
+      ASSERT_TRUE(bio);
+      int ret = PEM_write_bio(bio.get(), label, "", data.data(), len);
+      if (len == 0) {
+        // An empty body has always been an error to write.
+        EXPECT_EQ(0, ret);
+        ERR_clear_error();
+        continue;
+      }
+      ASSERT_EQ(static_cast<int>(expected_body.size()), ret);
+      const uint8_t *contents;
+      size_t contents_len;
+      ASSERT_TRUE(BIO_mem_contents(bio.get(), &contents, &contents_len));
+      std::string expected = std::string("-----BEGIN ") + label + "-----\n" +
+                             expected_body + "-----END " + label + "-----\n";
+      EXPECT_EQ(Bytes(expected), Bytes(contents, contents_len));
+
+      char *name = nullptr, *header = nullptr;
+      uint8_t *decoded = nullptr;
+      long decoded_len = 0;
+      ASSERT_TRUE(
+          PEM_read_bio(bio.get(), &name, &header, &decoded, &decoded_len));
+      EXPECT_STREQ(label, name);
+      EXPECT_STREQ("", header);
+      EXPECT_EQ(Bytes(data), Bytes(decoded, decoded_len));
+      OPENSSL_free(name);
+      OPENSSL_free(header);
+      OPENSSL_free(decoded);
+#if defined(BORINGSSL_PEM_FAST_PUBLIC_BASE64)
+      EXPECT_EQ(decodes_before + (is_public ? 1 : 0), g_public_decodes);
+      EXPECT_EQ(encodes_before + (is_public ? 1 : 0), g_public_encodes);
+#endif
+    }
+  }
+
+  // Invalid base64 under a public label is still rejected.
+  static const char kBad[] =
+      "-----BEGIN CERTIFICATE-----\nAAA*\n-----END CERTIFICATE-----\n";
+  bssl::UniquePtr<BIO> bio(BIO_new_mem_buf(kBad, strlen(kBad)));
+  ASSERT_TRUE(bio);
+  char *name = nullptr, *header = nullptr;
+  uint8_t *decoded = nullptr;
+  long decoded_len = 0;
+  EXPECT_FALSE(PEM_read_bio(bio.get(), &name, &header, &decoded, &decoded_len));
+  EXPECT_TRUE(
+      ErrorEquals(ERR_get_error(), ERR_LIB_PEM, PEM_R_BAD_BASE64_DECODE));
+}

@@ -559,6 +559,36 @@ OPENSSL_EXPORT int PEM_write_PUBKEY(FILE *fp, const EVP_PKEY *in);
 // `PEM_read_bio_PrivateKey`.
 #define PEM_STRING_EVP_PKEY "ANY PRIVATE KEY"
 
+// Embedder base64 hooks.
+//
+// BoringSSL encodes and decodes PEM base64 in constant time because PEM may
+// carry private keys. When built with `BORINGSSL_PEM_FAST_PUBLIC_BASE64`, PEM
+// blocks whose label denotes public data (certificates, CRLs, certificate
+// requests, public keys and parameters) are instead passed to the following
+// functions, which the embedder must define and which need not be constant-time.
+// Every other label, including all private key types, keeps the constant-time
+// path.
+#if defined(BORINGSSL_PEM_FAST_PUBLIC_BASE64)
+// OPENSSL_pem_public_base64_decode decodes `in_len` bytes of base64 from `in`,
+// skipping ASCII whitespace, and writes at most `max_out` bytes to `out`. It
+// returns one and sets `*out_len` to the number of bytes written on success, or
+// zero if `in` is not valid base64 or the output does not fit. `in` and `out` do
+// not alias.
+int OPENSSL_pem_public_base64_decode(uint8_t *out, size_t *out_len,
+                                     size_t max_out, const uint8_t *in,
+                                     size_t in_len);
+
+// OPENSSL_pem_public_base64_encode base64-encodes `in_len` bytes from `in` to
+// `out`, with a newline after every 64 characters of output and after the final
+// partial line (if any), exactly as `EVP_EncodeUpdate` and `EVP_EncodeFinal`
+// would. `max_out` is at least the value `EVP_EncodedLength` reports for
+// `in_len` plus one byte per output line. It returns the number of bytes
+// written, not including any NUL terminator, or zero on error.
+size_t OPENSSL_pem_public_base64_encode(char *out, size_t max_out,
+                                        const uint8_t *in, size_t in_len);
+#endif
+
+
 // PEM_read_bio reads from `bio` until the next PEM block. If one is found, it
 // returns one and sets `*out_name`, `*out_header`, and `*out_data` to
 // newly-allocated buffers containing the PEM type, the header block, and the
