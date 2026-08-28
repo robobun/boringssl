@@ -24,6 +24,7 @@
 #include <algorithm>
 #include <atomic>
 #include <bitset>
+#include <cstdint>
 #include <initializer_list>
 #include <limits>
 #include <new>
@@ -58,6 +59,7 @@
 
 DECLARE_OPAQUE_STRUCT(ssl_credential_st, SSLCredential)
 DECLARE_OPAQUE_STRUCT(ssl_ctx_st, SSLContext)
+DECLARE_OPAQUE_STRUCT(ssl_st, SSLImpl)
 DECLARE_OPAQUE_STRUCT(ssl_ech_keys_st, SSLECHKeys)
 
 BSSL_NAMESPACE_BEGIN
@@ -186,11 +188,11 @@ bool ssl_negotiate_version(SSL_HANDSHAKE *hs, uint8_t *out_alert,
 // ssl_has_final_version returns whether `ssl` has determined the final version.
 // This may be used to distinguish the predictive 0-RTT version from the final
 // one.
-bool ssl_has_final_version(const SSL *ssl);
+bool ssl_has_final_version(const SSLImpl *ssl);
 
 // ssl_protocol_version returns `ssl`'s protocol version. It is an error to
 // call this function before the version is determined.
-uint16_t ssl_protocol_version(const SSL *ssl);
+uint16_t ssl_protocol_version(const SSLImpl *ssl);
 
 // Cipher suites.
 
@@ -285,20 +287,35 @@ BSSL_NAMESPACE_BEGIN
 //    A         E
 //    B -> D -> F
 //    C
-struct SSLCipherPreferenceList {
+class SSLCipherPreferenceList {
+ public:
   static constexpr bool kAllowUniquePtr = true;
 
   SSLCipherPreferenceList() = default;
-  ~SSLCipherPreferenceList();
+  ~SSLCipherPreferenceList() = default;
 
+  // Initializes a list with the specified ciphers and flags.
   bool Init(UniquePtr<STACK_OF(SSL_CIPHER)> ciphers,
-            Span<const bool> in_group_flags);
-  bool Init(const SSLCipherPreferenceList &);
+            Array<bool> in_group_flags);
 
+  // Makes `this` a deep copy of another (already initialized) instance.
+  bool CopyFrom(const SSLCipherPreferenceList &);
+
+  // Removes `cipher` from the preference list.
   void Remove(const SSL_CIPHER *cipher);
 
-  UniquePtr<STACK_OF(SSL_CIPHER)> ciphers;
-  bool *in_group_flags = nullptr;
+  size_t size() const { return sk_SSL_CIPHER_num(ciphers_.get()); }
+
+  const STACK_OF(SSL_CIPHER) *ciphers() const { return ciphers_.get(); }
+  STACK_OF(SSL_CIPHER) *ciphers() { return ciphers_.get(); }
+
+  Span<const bool> in_group_flags() const { return in_group_flags_; }
+
+ private:
+  // SSL_CIPHERs are maintained in a stack so they are easily accessible in the
+  // form required for `SSL{_CTX}_get_ciphers`.
+  UniquePtr<STACK_OF(SSL_CIPHER)> ciphers_;
+  Array<bool> in_group_flags_;
 };
 
 // AllCiphers returns an array of all supported ciphers, sorted by id.
@@ -323,11 +340,10 @@ const EVP_MD *ssl_get_handshake_digest(uint16_t version,
 // newly-allocated `SSLCipherPreferenceList` containing the result. It returns
 // true on success and false on failure. If `strict` is true, nonsense will be
 // rejected. If false, nonsense will be silently ignored. An empty result is
-// considered an error regardless of `strict`. `has_aes_hw` indicates if the
-// list should be ordered based on having support for AES in hardware or not.
+// considered an error regardless of `strict`. The resulting list will be
+// ordered based on having support for AES in hardware or not.
 bool ssl_create_cipher_list(UniquePtr<SSLCipherPreferenceList> *out_cipher_list,
-                            const bool has_aes_hw, const char *rule_str,
-                            bool strict);
+                            const char *rule_str, bool strict);
 
 // ssl_cipher_auth_mask_for_key returns the mask of cipher `algorithm_auth`
 // values suitable for use with `key` in TLS 1.2 and below. `sign_ok` indicates
@@ -364,7 +380,7 @@ bool ssl_tls13_cipher_meets_policy(uint16_t cipher_id,
                                    enum ssl_compliance_policy_t policy);
 
 // ssl_cipher_is_deprecated returns true if `cipher` is deprecated.
-OPENSSL_EXPORT bool ssl_cipher_is_deprecated(const SSL_CIPHER *cipher);
+bool ssl_cipher_is_deprecated(const SSL_CIPHER *cipher);
 
 
 // Transcript layer.
@@ -716,7 +732,7 @@ struct DTLSWriteEpoch {
 //
 // TODO(davidben): Expose this as part of public API once the high-level
 // buffer-free APIs are available.
-size_t ssl_record_prefix_len(const SSL *ssl);
+size_t ssl_record_prefix_len(const SSLImpl *ssl);
 
 enum ssl_open_record_t {
   ssl_open_record_success,
@@ -749,7 +765,7 @@ enum ssl_open_record_t {
 //
 // On failure or fatal alert, it returns `ssl_open_record_error` and sets
 // `*out_alert` to an alert to emit, or zero if no alert should be emitted.
-enum ssl_open_record_t tls_open_record(SSL *ssl, uint8_t *out_type,
+enum ssl_open_record_t tls_open_record(SSLImpl *ssl, uint8_t *out_type,
                                        Span<uint8_t> *out, size_t *out_consumed,
                                        uint8_t *out_alert, Span<uint8_t> in);
 
@@ -757,7 +773,7 @@ enum ssl_open_record_t tls_open_record(SSL *ssl, uint8_t *out_type,
 // `ssl_open_record_partial` if `in` was empty and sets `*out_consumed` to
 // zero. The caller should read one packet and try again. On success,
 // `*out_number` is set to the record number of the record.
-enum ssl_open_record_t dtls_open_record(SSL *ssl, uint8_t *out_type,
+enum ssl_open_record_t dtls_open_record(SSLImpl *ssl, uint8_t *out_type,
                                         DTLSRecordNumber *out_number,
                                         Span<uint8_t> *out,
                                         size_t *out_consumed,
@@ -765,7 +781,7 @@ enum ssl_open_record_t dtls_open_record(SSL *ssl, uint8_t *out_type,
 
 // ssl_needs_record_splitting returns one if `ssl`'s current outgoing cipher
 // state needs record-splitting and zero otherwise.
-bool ssl_needs_record_splitting(const SSL *ssl);
+bool ssl_needs_record_splitting(const SSLImpl *ssl);
 
 // tls_seal_record seals a new record of type `type` and body `in` and writes it
 // to `out`. At most `max_out` bytes will be written. It returns true on success
@@ -778,36 +794,38 @@ bool ssl_needs_record_splitting(const SSL *ssl);
 // bytes to `out`.
 //
 // `in` and `out` may not alias.
-bool tls_seal_record(SSL *ssl, uint8_t *out, size_t *out_len, size_t max_out,
-                     uint8_t type, const uint8_t *in, size_t in_len);
+bool tls_seal_record(SSLImpl *ssl, uint8_t *out, size_t *out_len,
+                     size_t max_out, uint8_t type, const uint8_t *in,
+                     size_t in_len);
 
 // dtls_record_header_write_len returns the length of the record header that
 // will be written at `epoch`.
-size_t dtls_record_header_write_len(const SSL *ssl, uint16_t epoch);
+size_t dtls_record_header_write_len(const SSLImpl *ssl, uint16_t epoch);
 
 // dtls_max_seal_overhead returns the maximum overhead, in bytes, of sealing a
 // record.
-size_t dtls_max_seal_overhead(const SSL *ssl, uint16_t epoch);
+size_t dtls_max_seal_overhead(const SSLImpl *ssl, uint16_t epoch);
 
 // dtls_seal_prefix_len returns the number of bytes of prefix to reserve in
 // front of the plaintext when sealing a record in-place.
-size_t dtls_seal_prefix_len(const SSL *ssl, uint16_t epoch);
+size_t dtls_seal_prefix_len(const SSLImpl *ssl, uint16_t epoch);
 
 // dtls_seal_max_input_len returns the maximum number of input bytes that can
 // fit in a record of up to `max_out` bytes, or zero if none may fit.
-size_t dtls_seal_max_input_len(const SSL *ssl, uint16_t epoch, size_t max_out);
+size_t dtls_seal_max_input_len(const SSLImpl *ssl, uint16_t epoch,
+                               size_t max_out);
 
 // dtls_get_read_epoch and dtls_get_write_epoch return the epoch corresponding
 // to `epoch` or nullptr if there is none.
-DTLSReadEpoch *dtls_get_read_epoch(const SSL *ssl, uint16_t epoch);
-DTLSWriteEpoch *dtls_get_write_epoch(const SSL *ssl, uint16_t epoch);
+DTLSReadEpoch *dtls_get_read_epoch(const SSLImpl *ssl, uint16_t epoch);
+DTLSWriteEpoch *dtls_get_write_epoch(const SSLImpl *ssl, uint16_t epoch);
 
 // dtls_seal_record implements `tls_seal_record` for DTLS. `epoch` selects which
 // epoch's cipher state to use. Unlike `tls_seal_record`, `in` and `out` may
 // alias but, if they do, `in` must be exactly `dtls_seal_prefix_len` bytes
 // ahead of `out`. On success, `*out_number` is set to the record number of the
 // record.
-bool dtls_seal_record(SSL *ssl, DTLSRecordNumber *out_number, uint8_t *out,
+bool dtls_seal_record(SSLImpl *ssl, DTLSRecordNumber *out_number, uint8_t *out,
                       size_t *out_len, size_t max_out, uint8_t type,
                       const uint8_t *in, size_t in_len, uint16_t epoch);
 
@@ -815,7 +833,7 @@ bool dtls_seal_record(SSL *ssl, DTLSRecordNumber *out_number, uint8_t *out,
 // state. It returns one of `ssl_open_record_discard`, `ssl_open_record_error`,
 // `ssl_open_record_close_notify`, or `ssl_open_record_fatal_alert` as
 // appropriate.
-enum ssl_open_record_t ssl_process_alert(SSL *ssl, uint8_t *out_alert,
+enum ssl_open_record_t ssl_process_alert(SSLImpl *ssl, uint8_t *out_alert,
                                          Span<const uint8_t> in);
 
 
@@ -845,12 +863,12 @@ UniquePtr<EVP_PKEY> ssl_parse_peer_subject_public_key_info(
 
 // ssl_pkey_supports_algorithm returns whether `pkey` may be used to sign
 // `sigalg`.
-bool ssl_pkey_supports_algorithm(const SSL *ssl, EVP_PKEY *pkey,
+bool ssl_pkey_supports_algorithm(const SSLImpl *ssl, EVP_PKEY *pkey,
                                  uint16_t sigalg, bool is_verify);
 
 // ssl_public_key_verify verifies that the `signature` is valid for the public
 // key `pkey` and input `in`, using the signature algorithm `sigalg`.
-bool ssl_public_key_verify(SSL *ssl, Span<const uint8_t> signature,
+bool ssl_public_key_verify(SSLImpl *ssl, Span<const uint8_t> signature,
                            uint16_t sigalg, EVP_PKEY *pkey,
                            Span<const uint8_t> in);
 
@@ -914,7 +932,7 @@ struct NamedGroup {
 Span<const NamedGroup> NamedGroups();
 
 // kNumNamedGroups is the number of supported groups.
-constexpr size_t kNumNamedGroups = 7u;
+constexpr size_t kNumNamedGroups = 6u;
 
 // DefaultSupportedGroupIds returns the list of IDs for the default groups that
 // are supported when the caller hasn't explicitly configured supported groups.
@@ -959,42 +977,42 @@ extern const uint8_t kJDK11DowngradeRandom[8];
 
 // ssl_max_handshake_message_len returns the maximum number of bytes permitted
 // in a handshake message for `ssl`.
-size_t ssl_max_handshake_message_len(const SSL *ssl);
+size_t ssl_max_handshake_message_len(const SSLImpl *ssl);
 
 // tls_can_accept_handshake_data returns whether `ssl` is able to accept more
 // data into handshake buffer.
-bool tls_can_accept_handshake_data(const SSL *ssl, uint8_t *out_alert);
+bool tls_can_accept_handshake_data(const SSLImpl *ssl, uint8_t *out_alert);
 
 // tls_has_unprocessed_handshake_data returns whether there is buffered
 // handshake data that has not been consumed by `get_message`.
-bool tls_has_unprocessed_handshake_data(const SSL *ssl);
+bool tls_has_unprocessed_handshake_data(const SSLImpl *ssl);
 
 // tls_append_handshake_data appends `data` to the handshake buffer. It returns
 // true on success and false on allocation failure.
-bool tls_append_handshake_data(SSL *ssl, Span<const uint8_t> data);
+bool tls_append_handshake_data(SSLImpl *ssl, Span<const uint8_t> data);
 
 // dtls_has_unprocessed_handshake_data behaves like
 // `tls_has_unprocessed_handshake_data` for DTLS.
-bool dtls_has_unprocessed_handshake_data(const SSL *ssl);
+bool dtls_has_unprocessed_handshake_data(const SSLImpl *ssl);
 
 // tls_flush_pending_hs_data flushes any handshake plaintext data.
-bool tls_flush_pending_hs_data(SSL *ssl);
+bool tls_flush_pending_hs_data(SSLImpl *ssl);
 
 // dtls_clear_outgoing_messages releases all buffered outgoing messages.
-void dtls_clear_outgoing_messages(SSL *ssl);
+void dtls_clear_outgoing_messages(SSLImpl *ssl);
 
 // dtls_clear_unused_write_epochs releases any write epochs that are no longer
 // needed.
-void dtls_clear_unused_write_epochs(SSL *ssl);
+void dtls_clear_unused_write_epochs(SSLImpl *ssl);
 
 
 // Callbacks.
 
 // ssl_do_info_callback calls `ssl`'s info callback, if set.
-void ssl_do_info_callback(const SSL *ssl, int type, int value);
+void ssl_do_info_callback(const SSLImpl *ssl, int type, int value);
 
 // ssl_do_msg_callback calls `ssl`'s message callback, if set.
-void ssl_do_msg_callback(const SSL *ssl, int is_write, int content_type,
+void ssl_do_msg_callback(const SSLImpl *ssl, int is_write, int content_type,
                          Span<const uint8_t> in);
 
 
@@ -1059,19 +1077,19 @@ class SSLBuffer {
 //
 // It is an error to call `ssl_read_buffer_extend_to` in DTLS when the buffer is
 // non-empty.
-int ssl_read_buffer_extend_to(SSL *ssl, size_t len);
+int ssl_read_buffer_extend_to(SSLImpl *ssl, size_t len);
 
 // ssl_handle_open_record handles the result of passing `ssl->s3->read_buffer`
 // to a record-processing function. If `ret` is a success or if the caller
 // should retry, it returns one and sets `*out_retry`. Otherwise, it returns <=
 // 0.
-int ssl_handle_open_record(SSL *ssl, bool *out_retry, ssl_open_record_t ret,
+int ssl_handle_open_record(SSLImpl *ssl, bool *out_retry, ssl_open_record_t ret,
                            size_t consumed, uint8_t alert);
 
 // ssl_write_buffer_flush flushes the write buffer to the transport. It returns
 // one on success and <= 0 on error. For DTLS, whether or not the write
 // succeeds, the write buffer will be cleared.
-int ssl_write_buffer_flush(SSL *ssl);
+int ssl_write_buffer_flush(SSLImpl *ssl);
 
 
 // Certificate functions.
@@ -1135,7 +1153,7 @@ UniquePtr<EVP_PKEY> ssl_cert_parse_pubkey(const CBS *in);
 // it returns a newly-allocated `CRYPTO_BUFFER` list and advances
 // `cbs`. Otherwise, it returns nullptr and sets `*out_alert` to an alert to
 // send to the peer.
-UniquePtr<STACK_OF(CRYPTO_BUFFER)> SSL_parse_CA_list(SSL *ssl,
+UniquePtr<STACK_OF(CRYPTO_BUFFER)> SSL_parse_CA_list(SSLImpl *ssl,
                                                      uint8_t *out_alert,
                                                      CBS *cbs);
 
@@ -1182,7 +1200,7 @@ bool tls13_advance_key_schedule(SSL_HANDSHAKE *hs, Span<const uint8_t> in);
 // tls13_set_traffic_key sets the read or write traffic keys to
 // `traffic_secret`. The version and cipher suite are determined from `session`.
 // It returns true on success and false on error.
-bool tls13_set_traffic_key(SSL *ssl, enum ssl_encryption_level_t level,
+bool tls13_set_traffic_key(SSLImpl *ssl, enum ssl_encryption_level_t level,
                            enum evp_aead_direction_t direction,
                            const SSL_SESSION *session,
                            Span<const uint8_t> traffic_secret);
@@ -1197,7 +1215,8 @@ bool tls13_derive_handshake_secrets(SSL_HANDSHAKE *hs);
 
 // tls13_rotate_traffic_key derives the next read or write traffic secret. It
 // returns true on success and false on error.
-bool tls13_rotate_traffic_key(SSL *ssl, enum evp_aead_direction_t direction);
+bool tls13_rotate_traffic_key(SSLImpl *ssl,
+                              enum evp_aead_direction_t direction);
 
 // tls13_derive_application_secrets derives the initial application data traffic
 // and exporter secrets based on the handshake transcripts and `master_secret`.
@@ -1209,7 +1228,7 @@ bool tls13_derive_resumption_secret(SSL_HANDSHAKE *hs);
 
 // tls13_export_keying_material provides an exporter interface to use the
 // `exporter_secret`.
-bool tls13_export_keying_material(const SSL *ssl, Span<uint8_t> out,
+bool tls13_export_keying_material(const SSLImpl *ssl, Span<uint8_t> out,
                                   Span<const uint8_t> secret,
                                   std::string_view label,
                                   Span<const uint8_t> context);
@@ -1349,7 +1368,7 @@ enum ssl_client_hello_type_t {
 //
 // This function is exported for fuzzing.
 OPENSSL_EXPORT bool ssl_decode_client_hello_inner(
-    SSL *ssl, uint8_t *out_alert, Array<uint8_t> *out_client_hello_inner,
+    SSLImpl *ssl, uint8_t *out_alert, Array<uint8_t> *out_client_hello_inner,
     Span<const uint8_t> encoded_client_hello_inner,
     const SSL_CLIENT_HELLO *client_hello_outer);
 
@@ -1366,7 +1385,7 @@ bool ssl_client_hello_decrypt(SSL_HANDSHAKE *hs, uint8_t *out_alert,
 
 // ssl_ech_confirmation_signal_hello_offset returns the offset of the ECH
 // confirmation signal in a ServerHello message, including the handshake header.
-size_t ssl_ech_confirmation_signal_hello_offset(const SSL *ssl);
+size_t ssl_ech_confirmation_signal_hello_offset(const SSLImpl *ssl);
 
 // ssl_ech_accept_confirmation computes the server's ECH acceptance signal,
 // writing it to `out`. The transcript portion is the concatenation of
@@ -1424,6 +1443,14 @@ enum class SSLCredentialType {
   kSPAKE2PlusV1Server,
   kPreSharedKey,
   kRawPublicKey,
+};
+
+struct SSLTrustAnchorRange {
+  Array<uint8_t> base;
+  uint64_t min = 0;
+  uint64_t max = 0;
+
+  bool Contains(Span<const uint8_t> id) const;
 };
 
 class SSLCredential : public ssl_credential_st,
@@ -1516,6 +1543,10 @@ class SSLCredential : public ssl_credential_st,
   // OCSP response to be sent to the client, if requested.
   UniquePtr<CRYPTO_BUFFER> ocsp_response;
 
+  // sid_ctx partitions the session space within a shared session cache or
+  // ticket key. If empty, the session ID context in `SSL` will be used.
+  InplaceVector<uint8_t, SSL_MAX_SID_CTX_LENGTH> sid_ctx;
+
   // SPAKE2+-specific information.
   Array<uint8_t> pake_context;
   Array<uint8_t> client_identity;
@@ -1547,6 +1578,10 @@ class SSLCredential : public ssl_credential_st,
   // trust_anchor_id, if non-empty, is the trust anchor ID for the root of the
   // chain in `chain`.
   Array<uint8_t> trust_anchor_id;
+
+  // trust_anchor_group_inclusions describes trust anchor groups that also match
+  // this credential.
+  Vector<SSLTrustAnchorRange> trust_anchor_group_inclusions;
 
   CRYPTO_EX_DATA ex_data;
 
@@ -1665,7 +1700,8 @@ enum ssl_grease_index_t {
   ssl_grease_version,
   ssl_grease_ticket_extension,
   ssl_grease_ech_config_id,
-  ssl_grease_last_index = ssl_grease_ech_config_id,
+  ssl_grease_signature_algorithm,
+  ssl_grease_last_index = ssl_grease_signature_algorithm,
 };
 
 enum tls12_server_hs_state_t {
@@ -1765,12 +1801,12 @@ struct SSLPAKEShare {
 };
 
 struct SSL_HANDSHAKE {
-  explicit SSL_HANDSHAKE(SSL *ssl);
+  explicit SSL_HANDSHAKE(SSLImpl *ssl);
   ~SSL_HANDSHAKE();
   static constexpr bool kAllowUniquePtr = true;
 
   // ssl is a non-owning pointer to the parent `SSL` object.
-  SSL *ssl;
+  SSLImpl *ssl;
 
   // config is a non-owning pointer to the handshake configuration.
   SSL_CONFIG *config;
@@ -1985,12 +2021,15 @@ struct SSL_HANDSHAKE {
   // key_block is the record-layer key block for TLS 1.2 and earlier.
   Array<uint8_t> key_block;
 
-  // hints contains the handshake hints for this connection. If
-  // `hints_requested` is true, this field is non-null and contains the pending
-  // hints to filled as the predicted handshake progresses. Otherwise, this
-  // field, if non-null, contains hints configured by the caller and will
-  // influence the handshake on match.
-  UniquePtr<SSL_HANDSHAKE_HINTS> hints;
+  // pending_hints, if non-null, contains the pending hints to filled as the
+  // predicted handshake progresses. If non-null, only the first round-trip of
+  // the handshake will complete, after which the `pending_hints` structure can
+  // be serialized.
+  UniquePtr<SSL_HANDSHAKE_HINTS> pending_hints;
+
+  // provided_hints, if non-null, contains hints configured by the caller
+  // and will influence the (real or predicted) handshake on match.
+  UniquePtr<SSL_HANDSHAKE_HINTS> provided_hints;
 
   // ech_is_inner, on the server, indicates whether the ClientHello contained an
   // inner ECH extension.
@@ -2069,11 +2108,6 @@ struct SSL_HANDSHAKE {
   // `SSL_get_error` returns `SSL_ERROR_HANDBACK`.  It is set by
   // `SSL_apply_handoff`.
   bool handback : 1;
-
-  // hints_requested indicates the caller has requested handshake hints. Only
-  // the first round-trip of the handshake will complete, after which the
-  // `hints` structure can be serialized.
-  bool hints_requested : 1;
 
   // cert_compression_negotiated is true iff `cert_compression_alg_id` is valid.
   bool cert_compression_negotiated : 1;
@@ -2163,11 +2197,11 @@ struct SSL_HANDSHAKE {
 // so many tickets.
 constexpr size_t kMaxTickets = 16;
 
-UniquePtr<SSL_HANDSHAKE> ssl_handshake_new(SSL *ssl);
+UniquePtr<SSL_HANDSHAKE> ssl_handshake_new(SSLImpl *ssl);
 
 // ssl_check_message_type checks if `msg` has type `type`. If so it returns
 // one. Otherwise, it sends an alert and returns zero.
-bool ssl_check_message_type(SSL *ssl, const SSLMessage &msg, int type);
+bool ssl_check_message_type(SSLImpl *ssl, const SSLMessage &msg, int type);
 
 // ssl_run_handshake runs the TLS handshake. It returns one on success and <= 0
 // on error. It sets `out_early_return` to one if we've completed the handshake
@@ -2190,11 +2224,11 @@ const char *tls13_server_handshake_state(SSL_HANDSHAKE *hs);
 
 // tls13_add_key_update queues a KeyUpdate message on `ssl`. `request_type` must
 // be one of `SSL_KEY_UPDATE_REQUESTED` or `SSL_KEY_UPDATE_NOT_REQUESTED`.
-bool tls13_add_key_update(SSL *ssl, int request_type);
+bool tls13_add_key_update(SSLImpl *ssl, int request_type);
 
 // tls13_post_handshake processes a post-handshake message. It returns true on
 // success and false on failure.
-bool tls13_post_handshake(SSL *ssl, const SSLMessage &msg);
+bool tls13_post_handshake(SSLImpl *ssl, const SSLMessage &msg);
 
 bool tls13_process_certificate(SSL_HANDSHAKE *hs, const SSLMessage &msg,
                                bool allow_anonymous);
@@ -2214,8 +2248,9 @@ bool tls13_add_certificate(SSL_HANDSHAKE *hs);
 enum ssl_private_key_result_t tls13_add_certificate_verify(SSL_HANDSHAKE *hs);
 
 bool tls13_add_finished(SSL_HANDSHAKE *hs);
-bool tls13_process_new_session_ticket(SSL *ssl, const SSLMessage &msg);
-UniquePtr<SSL_SESSION> tls13_create_session_with_ticket(SSL *ssl, CBS *body);
+bool tls13_process_new_session_ticket(SSLImpl *ssl, const SSLMessage &msg);
+UniquePtr<SSL_SESSION> tls13_create_session_with_ticket(SSLImpl *ssl,
+                                                        CBS *body);
 
 // ssl_setup_extension_permutation computes a ClientHello extension permutation
 // for `hs`, if applicable. It returns true on success and false on error.
@@ -2468,13 +2503,13 @@ bool ssl_parse_flags_extension_response(const CBS *cbs, SSLFlags *out,
 
 // ssl_log_secret logs `secret` with label `label`, if logging is enabled for
 // `ssl`. It returns true on success and false on failure.
-bool ssl_log_secret(const SSL *ssl, const char *label,
+bool ssl_log_secret(const SSLImpl *ssl, const char *label,
                     Span<const uint8_t> secret);
 
 
 // ClientHello functions.
 
-bool ssl_parse_client_hello_with_trailing_data(const SSL *ssl, CBS *cbs,
+bool ssl_parse_client_hello_with_trailing_data(const SSLImpl *ssl, CBS *cbs,
                                                SSL_CLIENT_HELLO *out);
 
 bool ssl_client_hello_get_extension(const SSL_CLIENT_HELLO *client_hello,
@@ -2594,25 +2629,26 @@ struct CERT {
 // `SSL_PROTOCOL_METHOD` abstracts between TLS and DTLS.
 struct SSL_PROTOCOL_METHOD {
   bool is_dtls;
-  bool (*ssl_new)(SSL *ssl);
-  void (*ssl_free)(SSL *ssl);
+  bool (*ssl_new)(SSLImpl *ssl);
+  void (*ssl_free)(SSLImpl *ssl);
   // get_message sets `*out` to the current handshake message and returns true
   // if one has been received. It returns false if more input is needed.
-  bool (*get_message)(const SSL *ssl, SSLMessage *out);
+  bool (*get_message)(const SSLImpl *ssl, SSLMessage *out);
   // next_message is called to release the current handshake message.
-  void (*next_message)(SSL *ssl);
+  void (*next_message)(SSLImpl *ssl);
   // has_unprocessed_handshake_data returns whether there is buffered
   // handshake data that has not been consumed by `get_message`.
-  bool (*has_unprocessed_handshake_data)(const SSL *ssl);
+  bool (*has_unprocessed_handshake_data)(const SSLImpl *ssl);
   // Use the `ssl_open_handshake` wrapper.
-  ssl_open_record_t (*open_handshake)(SSL *ssl, size_t *out_consumed,
+  ssl_open_record_t (*open_handshake)(SSLImpl *ssl, size_t *out_consumed,
                                       uint8_t *out_alert, Span<uint8_t> in);
   // Use the `ssl_open_change_cipher_spec` wrapper.
-  ssl_open_record_t (*open_change_cipher_spec)(SSL *ssl, size_t *out_consumed,
+  ssl_open_record_t (*open_change_cipher_spec)(SSLImpl *ssl,
+                                               size_t *out_consumed,
                                                uint8_t *out_alert,
                                                Span<uint8_t> in);
   // Use the `ssl_open_app_data` wrapper.
-  ssl_open_record_t (*open_app_data)(SSL *ssl, Span<uint8_t> *out,
+  ssl_open_record_t (*open_app_data)(SSLImpl *ssl, Span<uint8_t> *out,
                                      size_t *out_consumed, uint8_t *out_alert,
                                      Span<uint8_t> in);
   // write_app_data encrypts and writes `in` as application data. On success, it
@@ -2620,33 +2656,33 @@ struct SSL_PROTOCOL_METHOD {
   // written. Otherwise, it returns <= 0 and sets `*out_needs_handshake` to
   // whether the operation failed because the caller needs to drive the
   // handshake.
-  int (*write_app_data)(SSL *ssl, bool *out_needs_handshake,
+  int (*write_app_data)(SSLImpl *ssl, bool *out_needs_handshake,
                         size_t *out_bytes_written, Span<const uint8_t> in);
-  int (*dispatch_alert)(SSL *ssl);
+  int (*dispatch_alert)(SSLImpl *ssl);
   // init_message begins a new handshake message of type `type`. `cbb` is the
   // root CBB to be passed into `finish_message`. `*body` is set to a child CBB
   // the caller should write to. It returns true on success and false on error.
-  bool (*init_message)(const SSL *ssl, CBB *cbb, CBB *body, uint8_t type);
+  bool (*init_message)(const SSLImpl *ssl, CBB *cbb, CBB *body, uint8_t type);
   // finish_message finishes a handshake message. It sets `*out_msg` to the
   // serialized message. It returns true on success and false on error.
-  bool (*finish_message)(const SSL *ssl, CBB *cbb, Array<uint8_t> *out_msg);
+  bool (*finish_message)(const SSLImpl *ssl, CBB *cbb, Array<uint8_t> *out_msg);
   // add_message adds a handshake message to the pending flight. It returns
   // true on success and false on error.
-  bool (*add_message)(SSL *ssl, Array<uint8_t> msg);
+  bool (*add_message)(SSLImpl *ssl, Array<uint8_t> msg);
   // add_change_cipher_spec adds a ChangeCipherSpec record to the pending
   // flight. It returns true on success and false on error.
-  bool (*add_change_cipher_spec)(SSL *ssl);
+  bool (*add_change_cipher_spec)(SSLImpl *ssl);
   // finish_flight marks the pending flight as finished and ready to send.
   // `flush` must be called to write it.
-  void (*finish_flight)(SSL *ssl);
+  void (*finish_flight)(SSLImpl *ssl);
   // schedule_ack schedules a DTLS 1.3 ACK to be sent, without an ACK delay.
   // `flush` must be called to write it.
-  void (*schedule_ack)(SSL *ssl);
+  void (*schedule_ack)(SSLImpl *ssl);
   // flush writes any scheduled data to the transport. It returns one on success
   // and <= 0 on error.
-  int (*flush)(SSL *ssl);
+  int (*flush)(SSLImpl *ssl);
   // on_handshake_complete is called when the handshake is complete.
-  void (*on_handshake_complete)(SSL *ssl);
+  void (*on_handshake_complete)(SSLImpl *ssl);
   // set_read_state sets `ssl`'s read cipher state and level to `aead_ctx` and
   // `level`. In QUIC, `aead_ctx` is a placeholder object. In TLS 1.3,
   // `traffic_secret` is the original traffic secret. This function returns true
@@ -2654,7 +2690,7 @@ struct SSL_PROTOCOL_METHOD {
   //
   // TODO(crbug.com/371998381): Take the traffic secrets as input and let the
   // function create the SSLAEADContext.
-  bool (*set_read_state)(SSL *ssl, ssl_encryption_level_t level,
+  bool (*set_read_state)(SSLImpl *ssl, ssl_encryption_level_t level,
                          UniquePtr<SSLAEADContext> aead_ctx,
                          Span<const uint8_t> traffic_secret);
   // set_write_state sets `ssl`'s write cipher state and level to `aead_ctx` and
@@ -2664,7 +2700,7 @@ struct SSL_PROTOCOL_METHOD {
   //
   // TODO(crbug.com/371998381): Take the traffic secrets as input and let the
   // function create the SSLAEADContext.
-  bool (*set_write_state)(SSL *ssl, ssl_encryption_level_t level,
+  bool (*set_write_state)(SSLImpl *ssl, ssl_encryption_level_t level,
                           UniquePtr<SSLAEADContext> aead_ctx,
                           Span<const uint8_t> traffic_secret);
 };
@@ -2673,12 +2709,13 @@ struct SSL_PROTOCOL_METHOD {
 
 // ssl_open_handshake processes a record from `in` for reading a handshake
 // message.
-ssl_open_record_t ssl_open_handshake(SSL *ssl, size_t *out_consumed,
+ssl_open_record_t ssl_open_handshake(SSLImpl *ssl, size_t *out_consumed,
                                      uint8_t *out_alert, Span<uint8_t> in);
 
 // ssl_open_change_cipher_spec processes a record from `in` for reading a
 // ChangeCipherSpec.
-ssl_open_record_t ssl_open_change_cipher_spec(SSL *ssl, size_t *out_consumed,
+ssl_open_record_t ssl_open_change_cipher_spec(SSLImpl *ssl,
+                                              size_t *out_consumed,
                                               uint8_t *out_alert,
                                               Span<uint8_t> in);
 
@@ -2687,7 +2724,7 @@ ssl_open_record_t ssl_open_change_cipher_spec(SSL *ssl, size_t *out_consumed,
 // input. If it encounters a post-handshake message, it returns
 // `ssl_open_record_discard`. The caller should then retry, after processing any
 // messages received with `get_message`.
-ssl_open_record_t ssl_open_app_data(SSL *ssl, Span<uint8_t> *out,
+ssl_open_record_t ssl_open_app_data(SSLImpl *ssl, Span<uint8_t> *out,
                                     size_t *out_consumed, uint8_t *out_alert,
                                     Span<uint8_t> in);
 
@@ -3078,7 +3115,7 @@ class DTLSMessageBitmap {
   size_t first_unmarked_byte_ = 0;
 };
 
-struct hm_header_st {
+struct DTLSHandshakeHeader {
   uint8_t type;
   uint32_t msg_len;
   uint16_t seq;
@@ -3088,24 +3125,59 @@ struct hm_header_st {
 
 // An DTLSIncomingMessage is an incoming DTLS message, possibly not yet
 // assembled.
-struct DTLSIncomingMessage {
+class DTLSIncomingMessage {
+ public:
   static constexpr bool kAllowUniquePtr = true;
 
-  Span<uint8_t> msg() { return Span(data).subspan(DTLS1_HM_HEADER_LENGTH); }
-  Span<const uint8_t> msg() const {
-    return Span(data).subspan(DTLS1_HM_HEADER_LENGTH);
-  }
-  size_t msg_len() const { return msg().size(); }
+  explicit DTLSIncomingMessage(const DTLSHandshakeHeader &hdr);
 
-  // type is the type of the message.
-  uint8_t type = 0;
-  // seq is the sequence number of this message.
-  uint16_t seq = 0;
-  // data contains the message, including the message header of length
-  // `DTLS1_HM_HEADER_LENGTH`.
-  Array<uint8_t> data;
-  // reassembly tracks which parts of the message have been received.
-  DTLSMessageBitmap reassembly;
+  uint8_t type() const { return type_; }
+  uint16_t seq() const { return seq_; }
+  size_t msg_len() const {
+    return std::holds_alternative<FragmentList>(msg_)
+               ? std::get<FragmentList>(msg_).msg_len
+               : std::get<ReassemblyBuffer>(msg_).msg.size() -
+                     DTLS1_HM_HEADER_LENGTH;
+  }
+
+  // AddFragment adds the fragment to the incoming message. It returns true on
+  // success and false on error. The caller must have checked that `offset` and
+  // `data` fit in the message body.
+  bool AddFragment(uint32_t offset, Span<const uint8_t> data);
+
+  // IsComplete returns whether the incoming message is complete.
+  bool IsComplete() const;
+
+  // GetMessage returns the message as an SSLMessage if complete, and
+  // std::nullopt otherwise.
+  std::optional<SSLMessage> GetMessage() const;
+
+ private:
+  struct FragmentList {
+    // fragments contains fragment data in order of 24-bit offset, 24-bit
+    // length, data.
+    Vector<uint8_t> fragments;
+    // msg_len contains the length of the handshake message.
+    uint32_t msg_len;
+  };
+
+  struct ReassemblyBuffer {
+    void AddFragment(uint32_t offset, Span<const uint8_t> data);
+
+    // msg holds the message data, including `DTLS1_HM_HEADER_LENGTH` bytes
+    // of reconstructed header.
+    Array<uint8_t> msg;
+    // reassembly tracks which parts of the message have been received.
+    DTLSMessageBitmap reassembly;
+  };
+
+  uint8_t type_;
+  uint16_t seq_;
+  // msg_ holds the message data. Before enough data has been received for the
+  // message to be complete, it stores a FragmentList, which is proportional to
+  // total data received. Once the message might be complete, it switches to
+  // ReassemblyBuffer, which is proportional to the final amount.
+  std::variant<FragmentList, ReassemblyBuffer> msg_;
 };
 
 struct DTLSOutgoingMessage {
@@ -3346,11 +3418,11 @@ struct ALPSConfig {
 struct SSL_CONFIG {
   static constexpr bool kAllowUniquePtr = true;
 
-  explicit SSL_CONFIG(SSL *ssl_arg);
+  explicit SSL_CONFIG(SSLImpl *ssl_arg);
   ~SSL_CONFIG();
 
   // ssl is a non-owning pointer to the parent `SSL` object.
-  SSL *const ssl = nullptr;
+  SSLImpl *const ssl = nullptr;
 
   // conf_max_version is the maximum acceptable version configured by
   // `SSL_set_max_proto_version`. Note this version is not normalized in DTLS
@@ -3485,6 +3557,10 @@ struct SSL_CONFIG {
   // ClientHello.
   bool ech_grease_enabled : 1;
 
+  // reject_unusable_ech_config controls whether the client will fail the
+  // handshake if ECH cannot be offered.
+  bool reject_unusable_ech_config : 1;
+
   // Enable signed certificate time stamps. Currently client only.
   bool signed_cert_timestamps_enabled : 1;
 
@@ -3521,15 +3597,6 @@ struct SSL_CONFIG {
 
   // permute_extensions is whether to permute extensions when sending messages.
   bool permute_extensions : 1;
-
-  // aes_hw_override if set indicates we should override checking for aes
-  // hardware support, and use the value in aes_hw_override_value instead.
-  bool aes_hw_override : 1;
-
-  // aes_hw_override_value is used for testing to indicate the support or lack
-  // of support for AES hw. The value is only considered if `aes_hw_override` is
-  // true.
-  bool aes_hw_override_value : 1;
 
   // alps_use_new_codepoint if set indicates we use new ALPS extension codepoint
   // to negotiate and convey application settings.
@@ -3576,13 +3643,14 @@ uint32_t ssl_hash_session_id(Span<const uint8_t> session_id);
 
 // SSL_SESSION_parse parses an `SSL_SESSION` from `cbs` and advances `cbs` over
 // the parsed data.
-OPENSSL_EXPORT UniquePtr<SSL_SESSION> SSL_SESSION_parse(
-    CBS *cbs, const SSL_X509_METHOD *x509_method, CRYPTO_BUFFER_POOL *pool);
+UniquePtr<SSL_SESSION> SSL_SESSION_parse(CBS *cbs,
+                                         const SSL_X509_METHOD *x509_method,
+                                         CRYPTO_BUFFER_POOL *pool);
 
 // ssl_session_serialize writes `in` to `cbb` as if it were serialising a
 // session for Session-ID resumption. It returns true on success and false on
 // error.
-OPENSSL_EXPORT bool ssl_session_serialize(const SSL_SESSION *in, CBB *cbb);
+bool ssl_session_serialize(const SSL_SESSION *in, CBB *cbb);
 
 enum class SSLSessionType {
   // The session is not resumable.
@@ -3605,7 +3673,7 @@ bool ssl_session_is_context_valid(const SSL_HANDSHAKE *hs,
 
 // ssl_session_is_time_valid returns true if `session` is still valid and false
 // if it has expired.
-bool ssl_session_is_time_valid(const SSL *ssl, const SSL_SESSION *session);
+bool ssl_session_is_time_valid(const SSLImpl *ssl, const SSL_SESSION *session);
 
 // ssl_session_is_resumable returns whether `session` is resumable for `hs`.
 bool ssl_session_is_resumable(const SSL_HANDSHAKE *hs,
@@ -3624,7 +3692,7 @@ const EVP_MD *ssl_session_get_digest(const SSL_SESSION *session);
 // on the peer's certificate type) or a valid SHA-256 hash thereof.
 bool ssl_session_has_peer_cred(const SSL_SESSION *session);
 
-void ssl_set_session(SSL *ssl, SSL_SESSION *session);
+void ssl_set_session(SSLImpl *ssl, SSL_SESSION *session);
 
 // ssl_get_prev_session looks up the previous session based on `client_hello`.
 // On success, it sets `*out_session` to the session or nullptr if none was
@@ -3653,77 +3721,80 @@ OPENSSL_EXPORT UniquePtr<SSL_SESSION> SSL_SESSION_dup(
 
 // ssl_session_rebase_time updates `session`'s start time to the current time,
 // adjusting the timeout so the expiration time is unchanged.
-void ssl_session_rebase_time(SSL *ssl, SSL_SESSION *session);
+void ssl_session_rebase_time(SSLImpl *ssl, SSL_SESSION *session);
 
 // ssl_session_renew_timeout calls `ssl_session_rebase_time` and renews
 // `session`'s timeout to `timeout` (measured from the current time). The
 // renewal is clamped to the session's auth_timeout.
-void ssl_session_renew_timeout(SSL *ssl, SSL_SESSION *session,
+void ssl_session_renew_timeout(SSLImpl *ssl, SSL_SESSION *session,
                                uint32_t timeout);
 
-void ssl_update_cache(SSL *ssl);
+void ssl_update_cache(SSLImpl *ssl);
 
-void ssl_send_alert(SSL *ssl, int level, int desc);
-int ssl_send_alert_impl(SSL *ssl, int level, int desc);
-bool tls_get_message(const SSL *ssl, SSLMessage *out);
-ssl_open_record_t tls_open_handshake(SSL *ssl, size_t *out_consumed,
+void ssl_send_alert(SSLImpl *ssl, int level, int desc);
+int ssl_send_alert_impl(SSLImpl *ssl, int level, int desc);
+bool tls_get_message(const SSLImpl *ssl, SSLMessage *out);
+ssl_open_record_t tls_open_handshake(SSLImpl *ssl, size_t *out_consumed,
                                      uint8_t *out_alert, Span<uint8_t> in);
-void tls_next_message(SSL *ssl);
+void tls_next_message(SSLImpl *ssl);
 
-int tls_dispatch_alert(SSL *ssl);
-ssl_open_record_t tls_open_app_data(SSL *ssl, Span<uint8_t> *out,
+int tls_dispatch_alert(SSLImpl *ssl);
+ssl_open_record_t tls_open_app_data(SSLImpl *ssl, Span<uint8_t> *out,
                                     size_t *out_consumed, uint8_t *out_alert,
                                     Span<uint8_t> in);
-ssl_open_record_t tls_open_change_cipher_spec(SSL *ssl, size_t *out_consumed,
+ssl_open_record_t tls_open_change_cipher_spec(SSLImpl *ssl,
+                                              size_t *out_consumed,
                                               uint8_t *out_alert,
                                               Span<uint8_t> in);
-int tls_write_app_data(SSL *ssl, bool *out_needs_handshake,
+int tls_write_app_data(SSLImpl *ssl, bool *out_needs_handshake,
                        size_t *out_bytes_written, Span<const uint8_t> in);
 
-bool tls_new(SSL *ssl);
-void tls_free(SSL *ssl);
+bool tls_new(SSLImpl *ssl);
+void tls_free(SSLImpl *ssl);
 
-bool tls_init_message(const SSL *ssl, CBB *cbb, CBB *body, uint8_t type);
-bool tls_finish_message(const SSL *ssl, CBB *cbb, Array<uint8_t> *out_msg);
-bool tls_add_message(SSL *ssl, Array<uint8_t> msg);
-bool tls_add_change_cipher_spec(SSL *ssl);
-int tls_flush(SSL *ssl);
+bool tls_init_message(const SSLImpl *ssl, CBB *cbb, CBB *body, uint8_t type);
+bool tls_finish_message(const SSLImpl *ssl, CBB *cbb, Array<uint8_t> *out_msg);
+bool tls_add_message(SSLImpl *ssl, Array<uint8_t> msg);
+bool tls_add_change_cipher_spec(SSLImpl *ssl);
+int tls_flush(SSLImpl *ssl);
 
-bool dtls1_init_message(const SSL *ssl, CBB *cbb, CBB *body, uint8_t type);
-bool dtls1_finish_message(const SSL *ssl, CBB *cbb, Array<uint8_t> *out_msg);
-bool dtls1_add_message(SSL *ssl, Array<uint8_t> msg);
-bool dtls1_add_change_cipher_spec(SSL *ssl);
-void dtls1_finish_flight(SSL *ssl);
-void dtls1_schedule_ack(SSL *ssl);
-int dtls1_flush(SSL *ssl);
+bool dtls1_init_message(const SSLImpl *ssl, CBB *cbb, CBB *body, uint8_t type);
+bool dtls1_finish_message(const SSLImpl *ssl, CBB *cbb,
+                          Array<uint8_t> *out_msg);
+bool dtls1_add_message(SSLImpl *ssl, Array<uint8_t> msg);
+bool dtls1_add_change_cipher_spec(SSLImpl *ssl);
+void dtls1_finish_flight(SSLImpl *ssl);
+void dtls1_schedule_ack(SSLImpl *ssl);
+int dtls1_flush(SSLImpl *ssl);
 
 // ssl_add_message_cbb finishes the handshake message in `cbb` and adds it to
 // the pending flight. It returns true on success and false on error.
-bool ssl_add_message_cbb(SSL *ssl, CBB *cbb);
+bool ssl_add_message_cbb(SSLImpl *ssl, CBB *cbb);
 
 // ssl_hash_message incorporates `msg` into the handshake hash. It returns true
 // on success and false on allocation failure.
 bool ssl_hash_message(SSL_HANDSHAKE *hs, const SSLMessage &msg);
 
-ssl_open_record_t dtls1_process_ack(SSL *ssl, uint8_t *out_alert,
+ssl_open_record_t dtls1_process_ack(SSLImpl *ssl, uint8_t *out_alert,
                                     DTLSRecordNumber ack_record_number,
                                     Span<const uint8_t> data);
-ssl_open_record_t dtls1_open_app_data(SSL *ssl, Span<uint8_t> *out,
+ssl_open_record_t dtls1_open_app_data(SSLImpl *ssl, Span<uint8_t> *out,
                                       size_t *out_consumed, uint8_t *out_alert,
                                       Span<uint8_t> in);
-ssl_open_record_t dtls1_open_change_cipher_spec(SSL *ssl, size_t *out_consumed,
+ssl_open_record_t dtls1_open_change_cipher_spec(SSLImpl *ssl,
+                                                size_t *out_consumed,
                                                 uint8_t *out_alert,
                                                 Span<uint8_t> in);
 
-int dtls1_write_app_data(SSL *ssl, bool *out_needs_handshake,
+int dtls1_write_app_data(SSLImpl *ssl, bool *out_needs_handshake,
                          size_t *out_bytes_written, Span<const uint8_t> in);
 
 // dtls1_write_record sends a record. It returns one on success and <= 0 on
 // error.
-int dtls1_write_record(SSL *ssl, int type, Span<const uint8_t> in,
+int dtls1_write_record(SSLImpl *ssl, int type, Span<const uint8_t> in,
                        uint16_t epoch);
 
-bool dtls1_parse_fragment(CBS *cbs, struct hm_header_st *out_hdr,
+bool dtls1_parse_fragment(CBS *cbs, DTLSHandshakeHeader *out_hdr,
                           CBS *out_body);
 
 // DTLS1_MTU_TIMEOUTS is the maximum number of retransmit timeouts to expire
@@ -3734,28 +3805,28 @@ bool dtls1_parse_fragment(CBS *cbs, struct hm_header_st *out_hdr,
 // before failing the DTLS handshake.
 #define DTLS1_MAX_TIMEOUTS 12
 
-void dtls1_stop_timer(SSL *ssl);
+void dtls1_stop_timer(SSLImpl *ssl);
 
 unsigned int dtls1_min_mtu();
 
-bool dtls1_new(SSL *ssl);
-void dtls1_free(SSL *ssl);
+bool dtls1_new(SSLImpl *ssl);
+void dtls1_free(SSLImpl *ssl);
 
-bool dtls1_process_handshake_fragments(SSL *ssl, uint8_t *out_alert,
+bool dtls1_process_handshake_fragments(SSLImpl *ssl, uint8_t *out_alert,
                                        DTLSRecordNumber record_number,
                                        Span<const uint8_t> record);
-bool dtls1_get_message(const SSL *ssl, SSLMessage *out);
-ssl_open_record_t dtls1_open_handshake(SSL *ssl, size_t *out_consumed,
+bool dtls1_get_message(const SSLImpl *ssl, SSLMessage *out);
+ssl_open_record_t dtls1_open_handshake(SSLImpl *ssl, size_t *out_consumed,
                                        uint8_t *out_alert, Span<uint8_t> in);
-void dtls1_next_message(SSL *ssl);
-int dtls1_dispatch_alert(SSL *ssl);
+void dtls1_next_message(SSLImpl *ssl);
+int dtls1_dispatch_alert(SSLImpl *ssl);
 
 // tls1_configure_aead configures either the read or write direction AEAD (as
 // determined by `direction`) using the keys generated by the TLS KDF. The
 // `key_block_cache` argument is used to store the generated key block, if
 // empty. Otherwise it's assumed that the key block is already contained within
 // it. It returns true on success or false on error.
-bool tls1_configure_aead(SSL *ssl, evp_aead_direction_t direction,
+bool tls1_configure_aead(SSLImpl *ssl, evp_aead_direction_t direction,
                          Array<uint8_t> *key_block_cache,
                          const SSL_SESSION *session,
                          Span<const uint8_t> iv_override);
@@ -3833,19 +3904,19 @@ bool tls1_channel_id_hash(SSL_HANDSHAKE *hs, uint8_t *out, size_t *out_len);
 bool tls1_record_handshake_hashes_for_channel_id(SSL_HANDSHAKE *hs);
 
 // ssl_can_write returns whether `ssl` is allowed to write.
-bool ssl_can_write(const SSL *ssl);
+bool ssl_can_write(const SSLImpl *ssl);
 
 // ssl_can_read returns whether `ssl` is allowed to read.
-bool ssl_can_read(const SSL *ssl);
+bool ssl_can_read(const SSLImpl *ssl);
 
 OPENSSL_timeval ssl_ctx_get_current_time(const SSLContext *ctx);
 
 // ssl_reset_error_state resets state for `SSL_get_error`.
-void ssl_reset_error_state(SSL *ssl);
+void ssl_reset_error_state(SSLImpl *ssl);
 
 // ssl_set_read_error sets `ssl`'s read half into an error state, saving the
 // current state of the error queue.
-void ssl_set_read_error(SSL *ssl);
+void ssl_set_read_error(SSLImpl *ssl);
 
 BSSL_NAMESPACE_END
 
@@ -4162,6 +4233,11 @@ class SSLContext : public ssl_ctx_st, public RefCounted<SSLContext> {
   // grease_enabled is whether GREASE (RFC 8701) is enabled.
   bool grease_enabled : 1;
 
+  // grease_sigalgs_enabled controls whether GREASE signature algorithms may be
+  // sent.
+  // TODO(crbug.com/526597789): Fold into `grease_enabled` once deployed safely.
+  bool grease_sigalgs_enabled : 1;
+
   // permute_extensions is whether to permute extensions when sending messages.
   bool permute_extensions : 1;
 
@@ -4181,15 +4257,6 @@ class SSLContext : public ssl_ctx_st, public RefCounted<SSLContext> {
   // If enable_early_data is true, early data can be sent and accepted.
   bool enable_early_data : 1;
 
-  // aes_hw_override if set indicates we should override checking for AES
-  // hardware support, and use the value in aes_hw_override_value instead.
-  bool aes_hw_override : 1;
-
-  // aes_hw_override_value is used for testing to indicate the support or lack
-  // of support for AES hardware. The value is only considered if
-  // `aes_hw_override` is true.
-  bool aes_hw_override_value : 1;
-
   // resumption_across_names_enabled indicates whether a TLS 1.3 server should
   // signal its sessions may be resumed across names in the server certificate.
   bool resumption_across_names_enabled : 1;
@@ -4198,39 +4265,41 @@ class SSLContext : public ssl_ctx_st, public RefCounted<SSLContext> {
   friend RefCounted;
   ~SSLContext();
 };
-BSSL_NAMESPACE_END
 
-struct ssl_st {
-  explicit ssl_st(bssl::SSLContext *ctx_arg);
-  ssl_st(const ssl_st &) = delete;
-  ssl_st &operator=(const ssl_st &) = delete;
-  ~ssl_st();
+class SSLImpl : public ssl_st {
+ public:
+  static constexpr bool kAllowUniquePtr = true;
+
+  explicit SSLImpl(SSLContext *ctx_arg);
+  SSLImpl(const SSLImpl &) = delete;
+  SSLImpl &operator=(const SSLImpl &) = delete;
+  ~SSLImpl();
 
   // method is the method table corresponding to the current protocol (DTLS or
   // TLS).
-  const bssl::SSL_PROTOCOL_METHOD *method = nullptr;
+  const SSL_PROTOCOL_METHOD *method = nullptr;
 
   // config is a container for handshake configuration.  Accesses to this field
   // should check for nullptr, since configuration may be shed after the
   // handshake completes.  (If you have the `SSL_HANDSHAKE` object at hand, use
   // that instead, and skip the null check.)
-  bssl::UniquePtr<bssl::SSL_CONFIG> config;
+  UniquePtr<SSL_CONFIG> config;
 
   uint16_t max_send_fragment = 0;
 
   // There are 2 BIO's even though they are normally both the same. This is so
   // data can be read and written to different handlers
 
-  bssl::UniquePtr<BIO> rbio;  // used by SSL_read
-  bssl::UniquePtr<BIO> wbio;  // used by SSL_write
+  UniquePtr<BIO> rbio;  // used by SSL_read
+  UniquePtr<BIO> wbio;  // used by SSL_write
 
   // do_handshake runs the handshake. On completion, it returns `ssl_hs_ok`.
   // Otherwise, it returns a value corresponding to what operation is needed to
   // progress.
-  bssl::ssl_hs_wait_t (*do_handshake)(bssl::SSL_HANDSHAKE *hs) = nullptr;
+  ssl_hs_wait_t (*do_handshake)(SSL_HANDSHAKE *hs) = nullptr;
 
-  bssl::SSL3_STATE *s3 = nullptr;   // TLS variables
-  bssl::DTLS1_STATE *d1 = nullptr;  // DTLS variables
+  SSL3_STATE *s3 = nullptr;   // TLS variables
+  DTLS1_STATE *d1 = nullptr;  // DTLS variables
 
   // callback that allows applications to peek at protocol messages
   void (*msg_callback)(int write_p, int version, int content_type,
@@ -4247,15 +4316,15 @@ struct ssl_st {
 
   // session is the configured session to be offered by the client. This session
   // is immutable.
-  bssl::UniquePtr<SSL_SESSION> session;
+  UniquePtr<SSL_SESSION> session;
 
   void (*info_callback)(const SSL *ssl, int type, int value) = nullptr;
 
-  bssl::UniquePtr<bssl::SSLContext> ctx;
+  UniquePtr<SSLContext> ctx;
 
   // session_ctx is the `SSLContext` used for the session cache and related
   // settings.
-  bssl::UniquePtr<bssl::SSLContext> session_ctx;
+  UniquePtr<SSLContext> session_ctx;
 
   // extra application data
   CRYPTO_EX_DATA ex_data;
@@ -4263,7 +4332,7 @@ struct ssl_st {
   uint32_t options = 0;  // protocol behaviour
   uint32_t mode = 0;     // API behaviour
   uint32_t max_cert_list = 0;
-  bssl::UniquePtr<char> hostname;
+  UniquePtr<char> hostname;
 
   // quic_method is the method table corresponding to the QUIC hooks.
   const SSL_QUIC_METHOD *quic_method = nullptr;
@@ -4287,6 +4356,7 @@ struct ssl_st {
   // signal its sessions may be resumed across names in the server certificate.
   bool resumption_across_names_enabled : 1;
 };
+BSSL_NAMESPACE_END
 
 struct ssl_session_st : public bssl::RefCounted<ssl_session_st> {
   explicit ssl_session_st(const bssl::SSL_X509_METHOD *method);

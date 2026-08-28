@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"boringssl.googlesource.com/boringssl.git/ssl/test/runner/hpke"
+	"golang.org/x/crypto/cryptobyte"
 )
 
 const (
@@ -262,7 +263,6 @@ const (
 	CurveP521           CurveID = 25
 	CurveX25519         CurveID = 29
 	CurveX25519MLKEM768 CurveID = 0x11ec
-	CurveX25519Kyber768 CurveID = 0x6399
 	CurveMLKEM1024      CurveID = 0x0202
 )
 
@@ -362,7 +362,7 @@ var supportedSignatureAlgorithms = []signatureAlgorithm{
 // SRTP protection profiles (See RFC 5764, section 4.1.2)
 const (
 	SRTP_AES128_CM_HMAC_SHA1_80 uint16 = 0x0001
-	SRTP_AES128_CM_HMAC_SHA1_32        = 0x0002
+	SRTP_AES128_CM_HMAC_SHA1_32 uint16 = 0x0002
 )
 
 // PskKeyExchangeMode values (see RFC 8446, section 4.2.9)
@@ -672,15 +672,14 @@ type Config struct {
 	// (resumption) support.
 	SessionTicketsDisabled bool
 
-	// SessionTicketKey is used by TLS servers to provide session
-	// resumption. See RFC 5077. If zero, it will be filled with
-	// random data before the first server handshake.
+	// SessionTicketKey, if not nil, is used by TLS servers to provide
+	// session resumption. See RFC 5077.
 	//
 	// If multiple servers are terminating connections for the same host
 	// they should all have the same SessionTicketKey. If the
 	// SessionTicketKey leaks, previously recorded and future TLS
 	// connections using that key are compromised.
-	SessionTicketKey [32]byte
+	SessionTicketKey *[32]byte
 
 	// ClientSessionCache is a cache of ClientSessionState entries
 	// for TLS session resumption.
@@ -789,8 +788,6 @@ type Config struct {
 	// Bugs specifies optional misbehaviour to be used for testing other
 	// implementations.
 	Bugs ProtocolBugs
-
-	serverInitOnce sync.Once // guards calling (*Config).serverInit
 }
 
 type BadValue int
@@ -2306,23 +2303,6 @@ type ProtocolBugs struct {
 	ExpectedServerPadding bool
 }
 
-func (c *Config) serverInit() {
-	if c.SessionTicketsDisabled {
-		return
-	}
-
-	// If the key has already been set then we have nothing to do.
-	for _, b := range c.SessionTicketKey {
-		if b != 0 {
-			return
-		}
-	}
-
-	if _, err := io.ReadFull(c.rand(), c.SessionTicketKey[:]); err != nil {
-		c.SessionTicketsDisabled = true
-	}
-}
-
 func (c *Config) rand() io.Reader {
 	r := c.Rand
 	if r == nil {
@@ -2363,7 +2343,7 @@ func (c *Config) maxVersion() uint16 {
 	return ret
 }
 
-var defaultCurvePreferences = []CurveID{CurveX25519MLKEM768, CurveX25519Kyber768, CurveMLKEM1024, CurveX25519, CurveP256, CurveP384, CurveP521}
+var defaultCurvePreferences = []CurveID{CurveX25519MLKEM768, CurveMLKEM1024, CurveX25519, CurveP256, CurveP384, CurveP521}
 
 func (c *Config) curvePreferences() []CurveID {
 	if c == nil || len(c.CurvePreferences) == 0 {
@@ -2431,6 +2411,50 @@ func (c *Config) verifySignatureAlgorithms() []signatureAlgorithm {
 		return c.VerifySignatureAlgorithms
 	}
 	return supportedSignatureAlgorithms
+}
+
+type TrustAnchorRange struct {
+	Base     []byte
+	Min, Max uint64
+}
+
+const (
+	certPropTrustAnchorID              uint16 = 0
+	certPropTrustAnchorGroupInclusions uint16 = 1
+)
+
+type CertificatePropertyList struct {
+	TrustAnchorID              []byte
+	TrustAnchorGroupInclusions []TrustAnchorRange
+}
+
+func (c *CertificatePropertyList) Empty() bool {
+	return len(c.TrustAnchorID) == 0 && len(c.TrustAnchorGroupInclusions) == 0
+}
+
+func (c *CertificatePropertyList) Marshal() []byte {
+	bb := cryptobyte.NewBuilder(nil)
+	bb.AddUint16LengthPrefixed(func(props *cryptobyte.Builder) {
+		if len(c.TrustAnchorID) != 0 {
+			props.AddUint16(certPropTrustAnchorID)
+			// The ID is encoded directly in the property data, with
+			// no additional length prefix.
+			addUint16LengthPrefixedBytes(props, c.TrustAnchorID)
+		}
+		if len(c.TrustAnchorGroupInclusions) != 0 {
+			props.AddUint16(certPropTrustAnchorGroupInclusions)
+			props.AddUint16LengthPrefixed(func(prop *cryptobyte.Builder) {
+				prop.AddUint16LengthPrefixed(func(ranges *cryptobyte.Builder) {
+					for _, r := range c.TrustAnchorGroupInclusions {
+						addUint8LengthPrefixedBytes(ranges, r.Base)
+						ranges.AddUint64(r.Min)
+						ranges.AddUint64(r.Max)
+					}
+				})
+			})
+		}
+	})
+	return bb.BytesOrPanic()
 }
 
 type CredentialType int
@@ -2522,14 +2546,22 @@ type Credential struct {
 	// AppendToImportedPSKIdentity is a byte string that is appended to the
 	// imported PSK identity.
 	AppendToImportedPSKIdentity []byte
-	// TrustAnchorID, if not empty, is the trust anchor ID for the issuer
-	// of the certificate chain.
-	TrustAnchorID []byte
+	// Properties is the certificate properties (draft-ietf-tls-trust-anchor-ids)
+	// associated with this credential.
+	Properties CertificatePropertyList
+	// SessionIDContext is the session ID context to configure on the credential.
+	SessionIDContext []byte
 }
 
 func (c *Credential) WithSignatureAlgorithms(sigAlgs ...signatureAlgorithm) *Credential {
 	ret := *c
 	ret.SignatureAlgorithms = sigAlgs
+	return &ret
+}
+
+func (c *Credential) WithSessionIDContext(sidCtx []byte) *Credential {
+	ret := *c
+	ret.SessionIDContext = sidCtx
 	return &ret
 }
 
@@ -2560,8 +2592,14 @@ func (c *Credential) signatureAlgorithms() []signatureAlgorithm {
 
 func (c *Credential) WithTrustAnchorID(id []byte) *Credential {
 	ret := *c
-	ret.TrustAnchorID = id
+	ret.Properties.TrustAnchorID = id
 	ret.MustMatchIssuer = true
+	return &ret
+}
+
+func (c *Credential) WithProperties(props CertificatePropertyList) *Credential {
+	ret := *c
+	ret.Properties = props
 	return &ret
 }
 
@@ -2745,6 +2783,12 @@ func containsGREASE(values []uint16) bool {
 	return slices.ContainsFunc(values, isGREASEValue)
 }
 
+func containsSigAlgsGREASE(values []signatureAlgorithm) bool {
+	return slices.ContainsFunc(values, func(s signatureAlgorithm) bool {
+		return isGREASEValue(uint16(s))
+	})
+}
+
 func isAllZero(v []byte) bool {
 	for _, b := range v {
 		if b != 0 {
@@ -2753,6 +2797,3 @@ func isAllZero(v []byte) bool {
 	}
 	return true
 }
-
-// https://github.com/golang/go/issues/45624
-func ptrTo[T any](t T) *T { return &t }

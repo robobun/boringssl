@@ -18,10 +18,7 @@ use alloc::{
 };
 use core::{
     ffi::CStr,
-    ptr::{
-        NonNull,
-        null, //
-    }, //
+    ptr::null, //
 };
 
 use bssl_x509::{
@@ -31,32 +28,90 @@ use bssl_x509::{
 
 use super::{
     Client,
+    Server,
+    TlsConnection,
+    TlsConnectionBuilder,
+    lifecycle::{
+        EstablishedTlsConnection,
+        TlsConnectionInHandshake, //
+    },
+    methods::HasPrivateKeyMethods,
     methods::HasTlsConnectionMethod, //
 };
 use crate::{
     check_lib_error,
     config::ConfigurationError,
-    connection::{
-        TlsConnection,
-        TlsConnectionBuilder,
-        lifecycle::{
-            EstablishedTlsConnection,
-            TlsConnectionInHandshake, //
-        }, //
-    }, //
     credentials::{
         CertificateType,
         CertificateVerificationMode,
+        DistinguishedName,
+        PrivateKeyDelegate,
         SignatureAlgorithm,
         TlsCredential,
         VerifyCertificate,
-        cert_cb, //
+        cert_cb,
+        get_peer_certificate_type,
+        get_peer_raw_public_key,
+        select_cert::{
+            ClientCertificateSelector,
+            ServerCertificateSelector,
+            select_cert_cb, //
+        }, //
     },
     errors::Error,
     ffi::slice_into_ffi_raw_parts,
     has_duplicates, //
 };
 
+/// # Asynchronous private key operations
+impl<R, M> TlsConnectionBuilder<R, M>
+where
+    M: HasPrivateKeyMethods + HasTlsConnectionMethod,
+{
+    /// Set the private key delegate.
+    ///
+    /// This will override the [`crate::context::TlsContext`] private key delegate.
+    pub fn with_private_key_delegate(
+        &mut self,
+        key_method: Option<Box<dyn PrivateKeyDelegate>>,
+    ) -> &mut Self {
+        self.in_handshake().set_private_key_delegate(key_method);
+        self
+    }
+}
+
+/// # Asynchronous private key operations
+impl<R, M> TlsConnectionInHandshake<'_, R, M>
+where
+    M: HasPrivateKeyMethods + HasTlsConnectionMethod,
+{
+    /// Set the private key delegate.
+    ///
+    /// This will override the [`crate::context::TlsContext`] private key delegate.
+    pub fn set_private_key_delegate(
+        &mut self,
+        key_method: Option<Box<dyn PrivateKeyDelegate>>,
+    ) -> &mut Self {
+        if key_method.is_some() {
+            unsafe {
+                // Safety: we only install our own vtable.
+                bssl_sys::SSL_set_private_key_method(
+                    self.ptr(),
+                    <M as HasPrivateKeyMethods>::METHODS,
+                );
+            }
+        } else {
+            unsafe {
+                // Safety: we only uninstall the vtable.
+                bssl_sys::SSL_set_private_key_method(self.ptr(), core::ptr::null());
+            }
+        }
+        self.0.get_connection_methods().private_key_delegate = key_method;
+        self
+    }
+}
+
+/// # Certificate verification
 impl<R, M> TlsConnectionBuilder<R, M>
 where
     M: HasTlsConnectionMethod,
@@ -70,7 +125,13 @@ where
             .set_certificate_verification_mode(mode);
         self
     }
+}
 
+/// # Custom certificate verification
+impl<R, M> TlsConnectionBuilder<R, M>
+where
+    M: HasPrivateKeyMethods + HasTlsConnectionMethod,
+{
     /// Configure the certificate verifier.
     ///
     /// See [`VerifyCertificate`] for how to implement a custom verifier.
@@ -122,6 +183,38 @@ where
     }
 }
 
+/// # Select certificate - Server
+impl<M> TlsConnectionBuilder<Server, M>
+where
+    M: HasTlsConnectionMethod,
+{
+    /// Set certificate selection callback on **server** side.
+    pub fn with_server_side_certificate_callback<T: 'static + ServerCertificateSelector<M>>(
+        &mut self,
+        cb: T,
+    ) -> &mut Self {
+        self.as_in_handshake()
+            .set_server_side_certificate_callback(cb);
+        self
+    }
+}
+
+/// # Select certificate - Client
+impl<M> TlsConnectionBuilder<Client, M>
+where
+    M: HasTlsConnectionMethod,
+{
+    /// Set certificate selection callback on **client** side.
+    pub fn with_client_side_certificate_callback<T: 'static + ClientCertificateSelector<M>>(
+        &mut self,
+        cb: T,
+    ) -> &mut Self {
+        self.as_in_handshake()
+            .set_client_side_certificate_callback(cb);
+        self
+    }
+}
+
 /// # Custom certificate verification
 impl<R, M> TlsConnectionInHandshake<'_, R, M>
 where
@@ -132,10 +225,9 @@ where
         &mut self,
         mode: CertificateVerificationMode,
     ) -> &mut Self {
-        let ctx = self.ptr();
         unsafe {
             // Safety: this method only updates the mode value.
-            bssl_sys::SSL_set_verify(ctx, mode as _, None);
+            bssl_sys::SSL_set_verify(self.ptr(), mode as _, None);
         }
         self
     }
@@ -149,27 +241,25 @@ where
     where
         V: VerifyCertificate + 'static,
     {
-        let ctx = self.ptr();
         unsafe {
             // Safety: we only install our own vtable.
             bssl_sys::SSL_set_custom_verify(
-                ctx,
+                self.ptr(),
                 mode as _,
                 Some(cert_cb::<super::methods::RustConnectionMethods<M>>),
             );
         }
-        self.get_connection_methods().verify_certificate_methods = Some(Box::new(verifier) as _);
+        self.0.get_connection_methods().verify_certificate_methods = Some(Box::new(verifier) as _);
         self
     }
 
     /// Remove custom certificate verifier.
     pub fn remove_certificate_verifier(&mut self, mode: CertificateVerificationMode) -> &mut Self {
-        let ctx = self.ptr();
         unsafe {
             // Safety: we only uninstall the vtable.
-            bssl_sys::SSL_set_custom_verify(ctx, mode as _, None);
+            bssl_sys::SSL_set_custom_verify(self.ptr(), mode as _, None);
         }
-        self.get_connection_methods().verify_certificate_methods = None;
+        self.0.get_connection_methods().verify_certificate_methods = None;
         self
     }
 
@@ -185,7 +275,7 @@ where
 }
 
 /// # Authenticating with the peer
-impl<M> TlsConnectionInHandshake<'_, Client, M>
+impl<R, M> TlsConnectionInHandshake<'_, R, M>
 where
     M: HasTlsConnectionMethod,
 {
@@ -206,6 +296,56 @@ where
         unsafe {
             // Safety: `credential` is still valid.
             bssl_sys::SSL_certs_clear(self.ptr());
+        }
+        self
+    }
+}
+
+/// # Select certificate - Server
+impl<M> TlsConnectionInHandshake<'_, Server, M>
+where
+    M: HasTlsConnectionMethod,
+{
+    /// Set certificate selection callback on **server** side.
+    pub fn set_server_side_certificate_callback<T: 'static + ServerCertificateSelector<M>>(
+        &mut self,
+        cb: T,
+    ) -> &mut Self {
+        let conn = self.ptr();
+        let methods = self.0.get_connection_methods();
+        methods.server_cert_cb = Some(Box::new(cb) as _);
+        unsafe {
+            // Safety: we only install our own vtable.
+            bssl_sys::SSL_set_cert_cb(
+                conn,
+                Some(select_cert_cb::<super::methods::RustConnectionMethods<M>, M>),
+                core::ptr::null_mut(),
+            );
+        }
+        self
+    }
+}
+
+/// # Select certificate - Client
+impl<M> TlsConnectionInHandshake<'_, Client, M>
+where
+    M: HasTlsConnectionMethod,
+{
+    /// Set certificate selection callback on **client** side.
+    pub fn set_client_side_certificate_callback<T: 'static + ClientCertificateSelector<M>>(
+        &mut self,
+        cb: T,
+    ) -> &mut Self {
+        let conn = self.ptr();
+        let methods = self.0.get_connection_methods();
+        methods.client_cert_cb = Some(Box::new(cb) as _);
+        unsafe {
+            // Safety: we only install our own vtable.
+            bssl_sys::SSL_set_cert_cb(
+                conn,
+                Some(select_cert_cb::<super::methods::RustConnectionMethods<M>, M>),
+                core::ptr::null_mut(),
+            );
         }
         self
     }
@@ -281,6 +421,20 @@ impl<M> TlsConnectionInHandshake<'_, Client, M> {
         });
         Ok(self)
     }
+
+    /// Set SNI extension hostname.
+    pub fn set_tlsext_host_name(&mut self, host_name: &str) -> Result<&mut Self, Error> {
+        let host_name = CString::new(host_name)
+            .map_err(|_| Error::Configuration(ConfigurationError::InvalidString))?;
+        check_lib_error!(unsafe {
+            // Safety:
+            // - the validity of the handle `self.0` is witnessed by `self`.
+            // - the host name string has been sanitised for internal NUL-bytes and NUL-terminated.
+            // - BoringSSL copies the string internally, so the pointer does not need to outlive the call.
+            bssl_sys::SSL_set_tlsext_host_name(self.0.ptr(), host_name.as_ptr())
+        });
+        Ok(self)
+    }
 }
 
 /// # Certificate verification - Certificate Chain Verification
@@ -322,25 +476,21 @@ impl<R, M> TlsConnectionInHandshake<'_, R, M> {
     }
 }
 
-/// # Sessions
+/// # Raw Public Key
 impl<R, M> TlsConnectionInHandshake<'_, R, M> {
-    /// Disable session creation.
-    pub fn disable_session(&mut self) -> &mut Self {
-        let ptr = self.ptr();
-        unsafe {
-            // Safety: the validity of the handle `ptr` is witnessed by `self`.
-            bssl_sys::SSL_set_mode(ptr, super::ConnectionMode::MODE_NO_SESSION_CREATION.bits());
-        }
-        self
-    }
-
-    /// Set the session for resumption.
-    pub fn set_session(&mut self, session: &crate::sessions::TlsSession) -> &mut Self {
-        unsafe {
-            // Safety: self.ptr and session.0 are valid.
-            bssl_sys::SSL_set_session(self.ptr.as_ptr(), session.0.as_ptr());
-        }
-        self
+    /// Set acceptable peer certificate types
+    pub fn set_accepted_peer_cert_types(
+        &mut self,
+        types: &[CertificateType],
+    ) -> Result<&mut Self, Error> {
+        let (types, types_len) = slice_into_ffi_raw_parts(types);
+        check_lib_error!(unsafe {
+            // Safety:
+            // - `self.ptr()` is a valid handle.
+            // - `CertificateType` is a `u8` with acceptable values by construction.
+            bssl_sys::SSL_set1_accepted_peer_cert_types(self.ptr(), types as *const _, types_len)
+        });
+        Ok(self)
     }
 }
 
@@ -389,23 +539,66 @@ impl<'a, R, M> EstablishedTlsConnection<'a, R, M> {
 
 impl<R, M> TlsConnection<R, M> {
     /// Get the peer's [`CertificateType`].
+    ///
+    /// Returns [`None`] if the handshake has not completed.
     pub fn get_peer_certificate_type(&self) -> Option<CertificateType> {
-        let ty = unsafe {
-            // Safety:
-            // - `self.ptr()` is a valid `SSL` handle.
-            bssl_sys::SSL_get_peer_cert_type(self.ptr())
-        };
-        ty.try_into().ok().and_then(|ty: u8| ty.try_into().ok())
+        if self.is_in_handshake() {
+            return None;
+        }
+        get_peer_certificate_type(self.ptr())
     }
 
     /// Get the peer's raw public key as DER-encoded `SubjectPublicKeyInfo`.
+    ///
+    /// Returns [`None`] if the handshake has not completed.
     pub fn get_peer_raw_public_key(&self) -> Option<Vec<u8>> {
-        let pkey = unsafe {
-            // Safety:
-            // - `self.ptr()` is a valid `SSL` handle.
-            // - `pkey` does not escape the current function frame.
-            NonNull::new(bssl_sys::SSL_get0_peer_rpk(self.ptr()))?
-        };
-        Some(crate::credentials::marshal_evp_into_spki(pkey))
+        if self.is_in_handshake() {
+            return None;
+        }
+        get_peer_raw_public_key(self.ptr())
+    }
+}
+
+/// # Certificate authorities - Client
+///
+/// TLS can send a list of supported certificate authorities to guide the peer in certificate
+/// selection.
+impl<M> TlsConnectionInHandshake<'_, Client, M> {
+    /// This setting advertises the list of certificate authorities names in the
+    /// `certificate_authorities` extension to send the client.
+    pub fn set_ca_acceptable_by_client(
+        &mut self,
+        names: impl IntoIterator<Item = DistinguishedName>,
+    ) -> &mut Self {
+        unsafe {
+            // Safety: this call only transfers the ownership of the stack.
+            bssl_sys::SSL_set0_CA_names(
+                self.ptr(),
+                DistinguishedName::into_crypto_buffer_stack(names),
+            )
+        }
+        self
+    }
+}
+
+/// # Certificate authorities - Server
+///
+/// TLS can send a list of supported certificate authorities to guide the peer in certificate
+/// selection.
+impl<M> TlsConnectionInHandshake<'_, Server, M> {
+    /// This setting advertises the list of certificate authorities names in the
+    /// `certificate_authorities` extension to send the server.
+    pub fn set_ca_acceptable_by_server(
+        &mut self,
+        names: impl IntoIterator<Item = DistinguishedName>,
+    ) -> &mut Self {
+        unsafe {
+            // Safety: this call only transfers the ownership of the stack.
+            bssl_sys::SSL_set0_client_CAs(
+                self.ptr(),
+                DistinguishedName::into_crypto_buffer_stack(names),
+            )
+        }
+        self
     }
 }

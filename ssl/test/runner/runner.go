@@ -47,6 +47,7 @@ import (
 	"boringssl.googlesource.com/boringssl.git/util/testresult"
 	"filippo.io/mldsa"
 	"golang.org/x/crypto/cryptobyte"
+	"golang.org/x/term"
 )
 
 var (
@@ -59,7 +60,7 @@ var (
 	mallocTest         = flag.Int64("malloc-test", -1, "If non-negative, run each test with each malloc in turn failing from the given number onwards.")
 	mallocTestDebug    = flag.Bool("malloc-test-debug", false, "If true, ask bssl_shim to abort rather than fail a malloc. This can be used with a specific value for --malloc-test to identity the malloc failing that is causing problems.")
 	jsonOutput         = flag.String("json-output", "", "The file to output JSON results to.")
-	pipe               = flag.Bool("pipe", false, "If true, print status output suitable for piping into another program.")
+	pipe               = flag.Bool("pipe", !term.IsTerminal(int(os.Stdout.Fd())), "If true, print status output suitable for piping into another program.")
 	testToRun          = flag.String("test", "", "Semicolon-separated patterns of tests to run, or empty to run all tests")
 	skipTest           = flag.String("skip", "", "Semicolon-separated patterns of tests to skip")
 	allowHintMismatch  = flag.String("allow-hint-mismatch", "", "Semicolon-separated patterns of tests where hints may mismatch")
@@ -220,8 +221,8 @@ var (
 )
 
 var (
-	testOCSPExtension = append([]byte{byte(extensionStatusRequest) >> 8, byte(extensionStatusRequest), 0, 8, statusTypeOCSP, 0, 0, 4}, testOCSPResponse...)
-	testSCTExtension  = append([]byte{byte(extensionSignedCertificateTimestamp) >> 8, byte(extensionSignedCertificateTimestamp), 0, byte(len(testSCTList))}, testSCTList...)
+	testOCSPExtension = append([]byte{byte(extensionStatusRequest >> 8), byte(extensionStatusRequest), 0, 8, statusTypeOCSP, 0, 0, 4}, testOCSPResponse...)
+	testSCTExtension  = append([]byte{byte(extensionSignedCertificateTimestamp >> 8), byte(extensionSignedCertificateTimestamp), 0, byte(len(testSCTList))}, testSCTList...)
 )
 
 var (
@@ -686,9 +687,6 @@ type testCase struct {
 	// should retry for early rejection. In a server test, this is whether the
 	// test expects the shim to reject early data.
 	expectEarlyDataRejected bool
-	// skipSplitHandshake, if true, will skip the generation of a split
-	// handshake copy of the test.
-	skipSplitHandshake bool
 	// skipHints, if true, will skip the generation of a handshake hints copy of
 	// the test.
 	skipHints bool
@@ -704,7 +702,9 @@ type testCase struct {
 	// shimCredentials is a list of credentials which should be configured at
 	// the shim. It differs from shimCertificate only in whether the old or
 	// new APIs are used.
-	shimCredentials       []*Credential
+	shimCredentials []*Credential
+	// resumeShimCredentials, if set, overrides shimCredentials for resumption
+	// connections.
 	resumeShimCredentials []*Credential
 }
 
@@ -815,7 +815,7 @@ func doExchange(test *testCase, config *Config, conn net.Conn, isResume bool, tr
 		}
 		conn = connDebug
 		if *flagDebug {
-			defer connDebug.WriteTo(os.Stdout)
+			defer connDebug.WriteFlowsTo(os.Stdout)
 		}
 		if *transcriptDir != "" {
 			defer func() {
@@ -1453,6 +1453,12 @@ func doExchanges(test *testCase, shim *shimProcess, resumeCount int, transcripts
 		config.Rand = &deterministicRand{}
 	}
 
+	var ticketKey [32]byte
+	if _, err := io.ReadFull(config.rand(), ticketKey[:]); err != nil {
+		return err
+	}
+	config.SessionTicketKey = &ticketKey
+
 	conn, err := shim.accept()
 	if err != nil {
 		return err
@@ -1463,7 +1469,6 @@ func doExchanges(test *testCase, shim *shimProcess, resumeCount int, transcripts
 		return err
 	}
 
-	nextTicketKey := config.SessionTicketKey
 	for i := range resumeCount {
 		var resumeConfig Config
 		if test.resumeConfig != nil {
@@ -1479,20 +1484,21 @@ func doExchanges(test *testCase, shim *shimProcess, resumeCount int, transcripts
 		if test.newSessionsOnResume {
 			resumeConfig.ClientSessionCache = nil
 			resumeConfig.ServerSessionCache = nil
-			if _, err := resumeConfig.rand().Read(resumeConfig.SessionTicketKey[:]); err != nil {
+			if _, err := io.ReadFull(resumeConfig.rand(), ticketKey[:]); err != nil {
 				return err
 			}
+			resumeConfig.SessionTicketKey = &ticketKey
 		} else {
 			resumeConfig.ClientSessionCache = config.ClientSessionCache
 			resumeConfig.ServerSessionCache = config.ServerSessionCache
 			// Rotate the ticket keys between each connection, with each connection
 			// encrypting with next connection's keys. This ensures that we test
 			// the renewed sessions.
-			resumeConfig.SessionTicketKey = nextTicketKey
-			if _, err := resumeConfig.rand().Read(nextTicketKey[:]); err != nil {
+			resumeConfig.SessionTicketKey = new(ticketKey)
+			if _, err := io.ReadFull(resumeConfig.rand(), ticketKey[:]); err != nil {
 				return err
 			}
-			resumeConfig.Bugs.EncryptSessionTicketKey = &nextTicketKey
+			resumeConfig.Bugs.EncryptSessionTicketKey = &ticketKey
 		}
 
 		var connResume net.Conn
@@ -1613,7 +1619,10 @@ func appendCredentialFlags(flags []string, cred *Credential, prefix string, newC
 	default:
 		panic(fmt.Sprintf("unknown PSK hash %s", cred.PSKHash))
 	}
-	handleBase64Field("trust-anchor-id", cred.TrustAnchorID)
+	if !cred.Properties.Empty() {
+		handleBase64Field("cert-properties", cred.Properties.Marshal())
+	}
+	handleBase64Field("session-id-context", cred.SessionIDContext)
 	return flags
 }
 
@@ -1627,12 +1636,12 @@ func runTest(dispatcher *shimDispatcher, statusChan chan statusMsg, test *testCa
 	}()
 
 	// Make a copy of the testCase before modifying it in-place.
-	test = ptrTo(*test)
+	test = new(*test)
 	if test.resumeConfig != nil {
-		test.resumeConfig = ptrTo(*test.resumeConfig)
+		test.resumeConfig = new(*test.resumeConfig)
 	}
 	if test.resumeExpectations != nil {
-		test.resumeExpectations = ptrTo(*test.resumeExpectations)
+		test.resumeExpectations = new(*test.resumeExpectations)
 	}
 
 	var flags []string
@@ -1645,6 +1654,10 @@ func runTest(dispatcher *shimDispatcher, statusChan chan statusMsg, test *testCa
 	if test.testType == serverTest {
 		flags = append(flags, "-server")
 	}
+
+	// Credential flags trigger state in the command-line parser, so append these
+	// flags first.
+	flags = append(flags, test.flags...)
 
 	// Configure the default credential.
 	shimCertificate := test.shimCertificate
@@ -1663,8 +1676,12 @@ func runTest(dispatcher *shimDispatcher, statusChan chan statusMsg, test *testCa
 	}
 
 	// Configure any additional credentials.
+	var initialPrefix string
+	if len(test.resumeShimCredentials) > 0 {
+		initialPrefix = "-on-initial"
+	}
 	for _, cred := range test.shimCredentials {
-		flags = appendCredentialFlags(flags, cred, "", true)
+		flags = appendCredentialFlags(flags, cred, initialPrefix, true)
 	}
 	for _, cred := range test.resumeShimCredentials {
 		flags = appendCredentialFlags(flags, cred, "-on-resume", true)
@@ -1853,8 +1870,6 @@ func runTest(dispatcher *shimDispatcher, statusChan chan statusMsg, test *testCa
 	if test.config.Credential != nil {
 		flags = append(flags, "-trust-cert", test.config.Credential.RootPath)
 	}
-
-	flags = append(flags, test.flags...)
 
 	var env []string
 	if mallocNumToFail >= 0 {
@@ -2066,7 +2081,7 @@ func allVersions(protocol protocol) []tlsVersion {
 	return ret
 }
 
-func convertToSplitHandshakeTests(tests []testCase) (splitHandshakeTests []testCase, err error) {
+func convertToHandshakeHintTests(tests []testCase) (handshakeHintTests []testCase, err error) {
 	var stdout bytes.Buffer
 	var flags []string
 	if len(*shimExtraFlags) > 0 {
@@ -2079,7 +2094,7 @@ func convertToSplitHandshakeTests(tests []testCase) (splitHandshakeTests []testC
 		return nil, err
 	}
 
-	switch strings.TrimSpace(string(stdout.Bytes())) {
+	switch strings.TrimSpace(stdout.String()) {
 	case "No":
 		return
 	case "Yes":
@@ -2091,32 +2106,6 @@ func convertToSplitHandshakeTests(tests []testCase) (splitHandshakeTests []testC
 	var allowHintMismatchPattern []string
 	if len(*allowHintMismatch) > 0 {
 		allowHintMismatchPattern = strings.Split(*allowHintMismatch, ";")
-	}
-
-NextTest:
-	for _, test := range tests {
-		if test.protocol != tls ||
-			test.testType != serverTest ||
-			len(test.shimCredentials) != 0 ||
-			len(test.resumeShimCredentials) != 0 ||
-			strings.Contains(test.name, "ECH-Server") ||
-			test.skipSplitHandshake {
-			continue
-		}
-
-		for _, flag := range test.flags {
-			if flag == "-implicit-handshake" {
-				continue NextTest
-			}
-		}
-
-		shTest := test
-		shTest.name += "-Split"
-		shTest.flags = make([]string, len(test.flags), len(test.flags)+3)
-		copy(shTest.flags, test.flags)
-		shTest.flags = append(shTest.flags, "-handoff", "-handshaker-path", *handshakerPath)
-
-		splitHandshakeTests = append(splitHandshakeTests, shTest)
 	}
 
 	for _, test := range tests {
@@ -2134,19 +2123,19 @@ NextTest:
 			}
 		}
 
-		shTest := test
-		shTest.name += "-Hints"
-		shTest.flags = make([]string, len(test.flags), len(test.flags)+3)
-		copy(shTest.flags, test.flags)
-		shTest.flags = append(shTest.flags, "-handshake-hints", "-handshaker-path", *handshakerPath)
+		hintTest := test
+		hintTest.name += "-Hints"
+		hintTest.flags = make([]string, len(test.flags), len(test.flags)+3)
+		copy(hintTest.flags, test.flags)
+		hintTest.flags = append(hintTest.flags, "-handshake-hints", "-handshaker-path", *handshakerPath)
 		if matched {
-			shTest.flags = append(shTest.flags, "-allow-hint-mismatch")
+			hintTest.flags = append(hintTest.flags, "-allow-hint-mismatch")
 		}
 
-		splitHandshakeTests = append(splitHandshakeTests, shTest)
+		handshakeHintTests = append(handshakeHintTests, hintTest)
 	}
 
-	return splitHandshakeTests, nil
+	return handshakeHintTests, nil
 }
 
 func worker(dispatcher *shimDispatcher, statusChan chan statusMsg, c chan *testCase, shimPath string, wg *sync.WaitGroup) {
@@ -2357,6 +2346,7 @@ func main() {
 	addMinimumVersionTests()
 	addExtensionTests()
 	addResumptionVersionTests()
+	addCredentialSessionIDContextTests()
 	addExtendedMasterSecretTests()
 	addRenegotiationTests()
 	addDTLSReplayTests()
@@ -2402,9 +2392,9 @@ func main() {
 	addRawPublicKeyTests()
 	addServerPaddingTests()
 
-	toAppend, err := convertToSplitHandshakeTests(testCases)
+	toAppend, err := convertToHandshakeHintTests(testCases)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error making split handshake tests: %s", err)
+		fmt.Fprintf(os.Stderr, "Error making handshake hint tests: %s", err)
 		os.Exit(1)
 	}
 	testCases = append(testCases, toAppend...)
