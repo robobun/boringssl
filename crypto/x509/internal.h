@@ -27,6 +27,7 @@
 // Internal structures.
 
 DECLARE_OPAQUE_STRUCT(x509_st, X509Impl)
+DECLARE_OPAQUE_STRUCT(x509_lazy_cert_set_st, X509LazyCertSet)
 DECLARE_OPAQUE_STRUCT(x509_store_st, X509Store)
 DECLARE_OPAQUE_STRUCT(X509_name_st, X509Name)
 DECLARE_OPAQUE_STRUCT(X509_name_entry_st, X509NameEntry)
@@ -82,6 +83,11 @@ class X509NameEntry : public X509_name_entry_st {
 // X509_NAME_ENTRY is an `ASN1_ITEM` whose ASN.1 type is AttributeTypeAndValue
 // (RFC 5280) and C type is `X509_NAME_ENTRY*`.
 DECLARE_ASN1_ITEM(X509_NAME_ENTRY)
+
+// x509_name_canon_from_der parses a DER-encoded Name from `cbs` and sets `out`
+// to its canonical form, as `X509_NAME_cmp` would compare it, without
+// constructing an `X509_NAME`. It returns one on success and zero on error.
+int x509_name_canon_from_der(CBS *cbs, Array<uint8_t> *out);
 
 struct X509NameCache {
   static constexpr bool kAllowUniquePtr = true;
@@ -362,6 +368,41 @@ struct x509_lookup_method_st {
 
 BSSL_NAMESPACE_BEGIN
 
+struct X509LazyCert {
+  const uint8_t *der = nullptr;
+  size_t der_len = 0;
+  // canon is the subject in the form `X509_NAME_cmp` compares.
+  Array<uint8_t> canon;
+  Atomic<X509 *> x509 = nullptr;
+};
+
+class X509LazyCertSet : public x509_lazy_cert_set_st,
+                        public RefCounted<X509LazyCertSet> {
+ public:
+  X509LazyCertSet();
+
+  // Init indexes `num` certificates by subject without parsing them. It
+  // returns false if any is not a well-formed Certificate.
+  bool Init(const uint8_t *const *certs, const size_t *cert_lens, size_t num);
+
+  size_t size() const { return certs_.size(); }
+
+  // Get returns the `idx`th certificate, parsing it on first call.
+  X509 *Get(size_t idx);
+
+  // AddMatchesToStore parses every certificate whose subject is `name` and adds
+  // it to `store`. It returns false on error; no match is not an error.
+  bool AddMatchesToStore(X509Store *store, const X509_NAME *name);
+
+ private:
+  friend RefCounted;
+  ~X509LazyCertSet();
+
+  Array<X509LazyCert> certs_;
+  // by_subject_ holds indices into `certs_` sorted by `canon`.
+  Array<size_t> by_subject_;
+};
+
 // This is used to hold everything.  It is used for all certificate
 // validation.  Once we have a certificate chain, the 'verify'
 // function is then called to actually check the cert chain.
@@ -369,9 +410,15 @@ class X509Store : public x509_store_st, public RefCounted<X509Store> {
  public:
   X509Store();
 
+  // MaterializeLazy adds any not-yet-parsed lazily trusted certificates with
+  // subject `name` to `objs`. It must be called without `objs_lock` held.
+  void MaterializeLazy(int type, const X509_NAME *name);
+
   // The following is a cache of trusted certs
   UniquePtr<STACK_OF(X509_OBJECT)> objs;  // Cache of all objects
   Mutex objs_lock;
+
+  Vector<UniquePtr<X509LazyCertSet>> lazy_cert_sets;
 
   // These are external lookup methods
   Vector<UniquePtr<X509_LOOKUP>> get_cert_methods;

@@ -727,7 +727,7 @@ if(BUILD_TESTING)
   add_dependencies(boringssl_all_tests urandom_test)
 
   add_executable(crypto_test ${CRYPTO_TEST_SOURCES})
-  target_link_libraries(crypto_test test_support_lib boringssl_gtest decrepit crypto)
+  target_link_libraries(crypto_test test_support_lib boringssl_gtest decrepit crypto decrepit crypto)
   add_dependencies(boringssl_all_tests crypto_test)
 
   add_executable(ssl_test ${SSL_TEST_SOURCES})

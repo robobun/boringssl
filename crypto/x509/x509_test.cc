@@ -11664,4 +11664,311 @@ TEST_F(X509VerifyMTCTest, InvalidMTCCABadSubject) {
 }
 
 }  // namespace
+
+static std::vector<uint8_t> CertToDER(X509 *cert) {
+  uint8_t *der = nullptr;
+  int len = i2d_X509(cert, &der);
+  std::vector<uint8_t> ret;
+  if (len > 0) {
+    ret.assign(der, der + len);
+  }
+  OPENSSL_free(der);
+  return ret;
+}
+
+static UniquePtr<X509_NAME> NameFromDER(const std::vector<uint8_t> &der) {
+  const uint8_t *p = der.data();
+  return UniquePtr<X509_NAME>(d2i_X509_NAME(nullptr, &p, der.size()));
+}
+
+// x509_name_canon_from_der must agree byte-for-byte with the canonical form
+// X509_NAME_cmp uses, including for string types and spellings that only match
+// after canonicalization.
+TEST(X509Test, NameCanonFromDER) {
+  struct Attr {
+    CBS_ASN1_TAG tag;
+    std::string value;
+  };
+  // make_name encodes a Name from RDNs of commonName attributes.
+  auto make_name = [](const std::vector<std::vector<Attr>> &rdns) {
+    static const uint8_t kCommonName[] = {0x55, 0x04, 0x03};
+    bssl::ScopedCBB cbb;
+    CBB seq, rdn, atv, oid, val;
+    EXPECT_TRUE(CBB_init(cbb.get(), 64));
+    EXPECT_TRUE(CBB_add_asn1(cbb.get(), &seq, CBS_ASN1_SEQUENCE));
+    for (const auto &attrs : rdns) {
+      EXPECT_TRUE(CBB_add_asn1(&seq, &rdn, CBS_ASN1_SET));
+      for (const auto &attr : attrs) {
+        EXPECT_TRUE(CBB_add_asn1(&rdn, &atv, CBS_ASN1_SEQUENCE));
+        EXPECT_TRUE(CBB_add_asn1(&atv, &oid, CBS_ASN1_OBJECT));
+        EXPECT_TRUE(CBB_add_bytes(&oid, kCommonName, sizeof(kCommonName)));
+        EXPECT_TRUE(CBB_add_asn1(&atv, &val, attr.tag));
+        EXPECT_TRUE(CBB_add_bytes(
+            &val, reinterpret_cast<const uint8_t *>(attr.value.data()),
+            attr.value.size()));
+        EXPECT_TRUE(CBB_flush(&rdn));
+      }
+      EXPECT_TRUE(CBB_flush(&seq));
+    }
+    EXPECT_TRUE(CBB_flush(cbb.get()));
+    return std::vector<uint8_t>(CBB_data(cbb.get()),
+                                CBB_data(cbb.get()) + CBB_len(cbb.get()));
+  };
+
+  std::vector<std::vector<uint8_t>> names;
+  names.push_back(make_name({{{CBS_ASN1_PRINTABLESTRING, "  Example   CA "}},
+                             {{CBS_ASN1_UTF8STRING, "Org"}}}));
+  names.push_back(make_name(
+      {{{CBS_ASN1_UTF8STRING, "example ca"}}, {{CBS_ASN1_IA5STRING, "org"}}}));
+  // UCS-2, then a multi-valued RDN with Latin-1 and a non-string value that is
+  // not canonicalized.
+  names.push_back(
+      make_name({{{CBS_ASN1_BMPSTRING, std::string("\0A\0b", 4)}},
+                 {{CBS_ASN1_T61STRING, "\xe9t\xe9 "},
+                  {CBS_ASN1_OCTETSTRING, "raw"}}}));
+  names.push_back(make_name(
+      {{{CBS_ASN1_UNIVERSALSTRING, std::string("\0\0\0a\0\0\0B", 8)}}}));
+  names.push_back(make_name({}));  // The empty name.
+  UniquePtr<X509> real_root(CertFromPEM(kRootCAPEM));
+  UniquePtr<X509> real_leaf(CertFromPEM(kLeafPEM));
+  ASSERT_TRUE(real_root && real_leaf);
+  for (X509 *cert : {real_root.get(), real_leaf.get()}) {
+    uint8_t *der = nullptr;
+    int len = i2d_X509_NAME(X509_get_subject_name(cert), &der);
+    ASSERT_GT(len, 0);
+    names.emplace_back(der, der + len);
+    OPENSSL_free(der);
+  }
+
+  std::vector<bssl::Array<uint8_t>> canons(names.size());
+  for (size_t i = 0; i < names.size(); i++) {
+    SCOPED_TRACE(Bytes(names[i]));
+    UniquePtr<X509_NAME> name = NameFromDER(names[i]);
+    ASSERT_TRUE(name);
+    const bssl::X509NameCache *cache = bssl::x509_name_get_cache(name.get());
+    ASSERT_TRUE(cache);
+    CBS cbs;
+    CBS_init(&cbs, names[i].data(), names[i].size());
+    ASSERT_TRUE(bssl::x509_name_canon_from_der(&cbs, &canons[i]));
+    EXPECT_EQ(0u, CBS_len(&cbs));
+    EXPECT_EQ(Bytes(cache->canon), Bytes(canons[i]));
+  }
+  // The first two spellings differ in DER but are the same name.
+  EXPECT_NE(Bytes(names[0]), Bytes(names[1]));
+  EXPECT_EQ(Bytes(canons[0]), Bytes(canons[1]));
+  EXPECT_EQ(0, X509_NAME_cmp(NameFromDER(names[0]).get(),
+                             NameFromDER(names[1]).get()));
+
+  // Trailing data and non-Names are rejected.
+  std::vector<uint8_t> bad = names[0];
+  bad.push_back(0);
+  CBS cbs;
+  bssl::Array<uint8_t> out;
+  CBS_init(&cbs, bad.data(), bad.size());
+  ASSERT_TRUE(bssl::x509_name_canon_from_der(&cbs, &out));
+  EXPECT_EQ(1u, CBS_len(&cbs));
+  static const uint8_t kNotAName[] = {0x04, 0x01, 0x00};
+  CBS_init(&cbs, kNotAName, sizeof(kNotAName));
+  EXPECT_FALSE(bssl::x509_name_canon_from_der(&cbs, &out));
+}
+
+static int VerifyWithStore(X509 *leaf, X509_STORE *store,
+                           const std::vector<X509 *> &intermediates) {
+  UniquePtr<STACK_OF(X509)> intermediates_stack(CertsToStack(intermediates));
+  UniquePtr<X509_STORE_CTX> ctx(X509_STORE_CTX_new());
+  if (!intermediates_stack || !ctx ||
+      !X509_STORE_CTX_init(ctx.get(), store, leaf,
+                           intermediates_stack.get())) {
+    return X509_V_ERR_UNSPECIFIED;
+  }
+  X509_VERIFY_PARAM_set_time_posix(X509_STORE_CTX_get0_param(ctx.get()),
+                                   kReferenceTime);
+  ERR_clear_error();
+  if (X509_verify_cert(ctx.get()) != 1) {
+    return X509_STORE_CTX_get_error(ctx.get());
+  }
+  return X509_V_OK;
+}
+
+TEST(X509Test, LazyCertSet) {
+  UniquePtr<X509> cross_signing_root(CertFromPEM(kCrossSigningRootPEM));
+  UniquePtr<X509> root(CertFromPEM(kRootCAPEM));
+  UniquePtr<X509> intermediate(CertFromPEM(kIntermediatePEM));
+  UniquePtr<X509> leaf(CertFromPEM(kLeafPEM));
+  ASSERT_TRUE(cross_signing_root && root && intermediate && leaf);
+
+  // The set neither copies nor frees the DER, so it must outlive the set.
+  static std::vector<std::vector<uint8_t>> ders;
+  ders = {CertToDER(cross_signing_root.get()), CertToDER(root.get()),
+          CertToDER(leaf.get())};
+  std::vector<const uint8_t *> ptrs;
+  std::vector<size_t> lens;
+  for (const auto &der : ders) {
+    ptrs.push_back(der.data());
+    lens.push_back(der.size());
+  }
+  UniquePtr<X509_LAZY_CERT_SET> set(
+      X509_LAZY_CERT_SET_new_static(ptrs.data(), lens.data(), ptrs.size()));
+  ASSERT_TRUE(set);
+  EXPECT_EQ(3u, X509_LAZY_CERT_SET_num(set.get()));
+
+  // Without the set, the leaf does not verify.
+  {
+    UniquePtr<X509_STORE> store(X509_STORE_new());
+    ASSERT_TRUE(store);
+    EXPECT_EQ(X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY,
+              VerifyWithStore(leaf.get(), store.get(), {intermediate.get()}));
+  }
+
+  UniquePtr<X509_STORE> store(X509_STORE_new());
+  ASSERT_TRUE(store);
+  ASSERT_TRUE(X509_STORE_add_lazy_cert_set(store.get(), set.get()));
+  // Adding twice is a no-op.
+  ASSERT_TRUE(X509_STORE_add_lazy_cert_set(store.get(), set.get()));
+  // Nothing has been parsed yet.
+  EXPECT_EQ(0u, sk_X509_OBJECT_num(X509_STORE_get0_objects(store.get())));
+
+  EXPECT_EQ(X509_V_OK,
+            VerifyWithStore(leaf.get(), store.get(), {intermediate.get()}));
+  // Only the root the chain named was materialized; the cross-signing root and
+  // the (irrelevant) leaf entry were not.
+  {
+    UniquePtr<STACK_OF(X509_OBJECT)> objs(X509_STORE_get1_objects(store.get()));
+    ASSERT_TRUE(objs);
+    ASSERT_EQ(1u, sk_X509_OBJECT_num(objs.get()));
+    EXPECT_EQ(0, X509_cmp(root.get(), X509_OBJECT_get0_X509(
+                                          sk_X509_OBJECT_value(objs.get(), 0))));
+  }
+  // Verifying again does not add a duplicate.
+  EXPECT_EQ(X509_V_OK,
+            VerifyWithStore(leaf.get(), store.get(), {intermediate.get()}));
+  EXPECT_EQ(1u, sk_X509_OBJECT_num(X509_STORE_get0_objects(store.get())));
+
+  // The parsed certificate is shared between the set and every store using it.
+  X509 *lazy_root = X509_LAZY_CERT_SET_get0(set.get(), 1);
+  ASSERT_TRUE(lazy_root);
+  EXPECT_EQ(lazy_root, X509_LAZY_CERT_SET_get0(set.get(), 1));
+  EXPECT_EQ(0, X509_cmp(root.get(), lazy_root));
+  EXPECT_EQ(nullptr, X509_LAZY_CERT_SET_get0(set.get(), 3));
+  {
+    UniquePtr<X509_STORE> store2(X509_STORE_new());
+    ASSERT_TRUE(store2);
+    ASSERT_TRUE(X509_STORE_add_lazy_cert_set(store2.get(), set.get()));
+    EXPECT_EQ(X509_V_OK, VerifyWithStore(leaf.get(), store2.get(),
+                                         {intermediate.get()}));
+    EXPECT_EQ(lazy_root, X509_OBJECT_get0_X509(sk_X509_OBJECT_value(
+                             X509_STORE_get0_objects(store2.get()), 0)));
+  }
+
+  // A lookup by a differently-spelled but canonically-equal name finds the
+  // anchor. Re-encode the root's subject with different case and string type.
+  {
+    UniquePtr<X509_STORE> store3(X509_STORE_new());
+    ASSERT_TRUE(store3);
+    ASSERT_TRUE(X509_STORE_add_lazy_cert_set(store3.get(), set.get()));
+    const X509_NAME *subject = X509_get_subject_name(root.get());
+    UniquePtr<X509_NAME> respelled(X509_NAME_new());
+    ASSERT_TRUE(respelled);
+    for (int i = 0; i < X509_NAME_entry_count(subject); i++) {
+      const X509_NAME_ENTRY *entry = X509_NAME_get_entry(subject, i);
+      const ASN1_STRING *value = X509_NAME_ENTRY_get_data(entry);
+      std::string upper(reinterpret_cast<const char *>(ASN1_STRING_get0_data(value)),
+                        ASN1_STRING_length(value));
+      for (char &c : upper) {
+        if (c >= 'a' && c <= 'z') {
+          c = c - 'a' + 'A';
+        }
+      }
+      upper = "  " + upper + " ";
+      ASSERT_TRUE(X509_NAME_add_entry_by_OBJ(
+          respelled.get(), X509_NAME_ENTRY_get_object(entry), V_ASN1_UTF8STRING,
+          reinterpret_cast<const uint8_t *>(upper.data()), upper.size(), -1, 0));
+    }
+    uint8_t *a = nullptr, *b = nullptr;
+    int a_len = i2d_X509_NAME(subject, &a);
+    int b_len = i2d_X509_NAME(respelled.get(), &b);
+    ASSERT_GT(a_len, 0);
+    ASSERT_GT(b_len, 0);
+    EXPECT_NE(Bytes(a, a_len), Bytes(b, b_len));
+    OPENSSL_free(a);
+    OPENSSL_free(b);
+    ASSERT_EQ(0, X509_NAME_cmp(subject, respelled.get()));
+
+    UniquePtr<X509_STORE_CTX> ctx(X509_STORE_CTX_new());
+    ASSERT_TRUE(ctx);
+    ASSERT_TRUE(X509_STORE_CTX_init(ctx.get(), store3.get(), leaf.get(), nullptr));
+    UniquePtr<STACK_OF(X509)> matches(
+        X509_STORE_CTX_get1_certs(ctx.get(), respelled.get()));
+    ASSERT_TRUE(matches);
+    ASSERT_EQ(1u, sk_X509_num(matches.get()));
+    EXPECT_EQ(lazy_root, sk_X509_value(matches.get(), 0));
+  }
+
+  // A different certificate with the same subject as a lazy anchor, added
+  // directly, does not hide the anchor: both are candidates, exactly as if both
+  // had been added with `X509_STORE_add_cert`.
+  {
+    UniquePtr<X509> root_cross_signed(CertFromPEM(kRootCrossSignedPEM));
+    ASSERT_TRUE(root_cross_signed);
+    ASSERT_EQ(0, X509_NAME_cmp(X509_get_subject_name(root_cross_signed.get()),
+                               X509_get_subject_name(root.get())));
+    UniquePtr<X509_STORE> store4(X509_STORE_new());
+    ASSERT_TRUE(store4);
+    ASSERT_TRUE(X509_STORE_add_cert(store4.get(), root_cross_signed.get()));
+    ASSERT_TRUE(X509_STORE_add_lazy_cert_set(store4.get(), set.get()));
+    UniquePtr<X509_STORE_CTX> ctx(X509_STORE_CTX_new());
+    ASSERT_TRUE(ctx);
+    ASSERT_TRUE(
+        X509_STORE_CTX_init(ctx.get(), store4.get(), leaf.get(), nullptr));
+    UniquePtr<STACK_OF(X509)> matches(
+        X509_STORE_CTX_get1_certs(ctx.get(), X509_get_subject_name(root.get())));
+    ASSERT_TRUE(matches);
+    EXPECT_EQ(2u, sk_X509_num(matches.get()));
+    // The chain terminates at the self-signed lazy anchor rather than failing
+    // to find an issuer for the cross-signed one.
+    EXPECT_EQ(X509_V_OK, VerifyWithStore(leaf.get(), store4.get(),
+                                         {intermediate.get()}));
+  }
+
+  // Malformed input is rejected up front rather than at lookup time.
+  static const uint8_t kTruncated[] = {0x30, 0x03, 0x30, 0x01};
+  const uint8_t *bad_ptr = kTruncated;
+  size_t bad_len = sizeof(kTruncated);
+  EXPECT_FALSE(X509_LAZY_CERT_SET_new_static(&bad_ptr, &bad_len, 1));
+  ERR_clear_error();
+}
+
+// Populating a store must not re-sort on every insertion, but duplicates must
+// still be rejected and lookups must still find every match.
+TEST(X509Test, StoreAddManyThenLookup) {
+  UniquePtr<X509> root(CertFromPEM(kRootCAPEM));
+  UniquePtr<X509> cross_signing_root(CertFromPEM(kCrossSigningRootPEM));
+  UniquePtr<X509> intermediate(CertFromPEM(kIntermediatePEM));
+  UniquePtr<X509> leaf(CertFromPEM(kLeafPEM));
+  ASSERT_TRUE(root && cross_signing_root && intermediate && leaf);
+
+  UniquePtr<X509_STORE> store(X509_STORE_new());
+  ASSERT_TRUE(store);
+  for (int i = 0; i < 3; i++) {
+    ASSERT_TRUE(X509_STORE_add_cert(store.get(), cross_signing_root.get()));
+    ASSERT_TRUE(X509_STORE_add_cert(store.get(), leaf.get()));
+    ASSERT_TRUE(X509_STORE_add_cert(store.get(), root.get()));
+    ASSERT_TRUE(X509_STORE_add_cert(store.get(), intermediate.get()));
+  }
+  EXPECT_EQ(4u, sk_X509_OBJECT_num(X509_STORE_get0_objects(store.get())));
+  EXPECT_EQ(X509_V_OK, VerifyWithStore(leaf.get(), store.get(), {}));
+
+  UniquePtr<X509_STORE_CTX> ctx(X509_STORE_CTX_new());
+  ASSERT_TRUE(ctx);
+  ASSERT_TRUE(X509_STORE_CTX_init(ctx.get(), store.get(), leaf.get(), nullptr));
+  for (X509 *cert :
+       {root.get(), cross_signing_root.get(), intermediate.get(), leaf.get()}) {
+    UniquePtr<STACK_OF(X509)> matches(
+        X509_STORE_CTX_get1_certs(ctx.get(), X509_get_subject_name(cert)));
+    ASSERT_TRUE(matches);
+    ASSERT_EQ(1u, sk_X509_num(matches.get()));
+    EXPECT_EQ(0, X509_cmp(cert, sk_X509_value(matches.get(), 0)));
+  }
+}
+
 BSSL_NAMESPACE_END

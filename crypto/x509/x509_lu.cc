@@ -20,7 +20,9 @@
 #include <utility>
 
 #include <openssl/err.h>
+#include <openssl/bytestring.h>
 #include <openssl/mem.h>
+#include <openssl/pool.h>
 #include <openssl/x509.h>
 
 #include "../internal.h"
@@ -179,6 +181,7 @@ int X509_STORE_CTX_get_by_subject(X509_STORE_CTX *vs, int type,
                                   const X509_NAME *name, X509_OBJECT *ret) {
   X509Store *ctx = FromOpaque(vs->ctx);
   X509_OBJECT stmp;
+  ctx->MaterializeLazy(type, name);
   ctx->objs_lock.LockWrite();
   X509_OBJECT *tmp =
       X509_OBJECT_retrieve_by_subject(ctx->objs.get(), type, name);
@@ -383,6 +386,7 @@ STACK_OF(X509) *X509_STORE_CTX_get1_certs(X509_STORE_CTX *ctx,
     return nullptr;
   }
   X509Store *store = FromOpaque(ctx->ctx);
+  store->MaterializeLazy(X509_LU_X509, nm);
   store->objs_lock.LockWrite();
   int idx = x509_object_idx_cnt(store->objs.get(), X509_LU_X509, nm, &cnt);
   if (idx < 0) {
@@ -458,7 +462,13 @@ STACK_OF(X509_CRL) *X509_STORE_CTX_get1_crls(X509_STORE_CTX *ctx,
 
 static X509_OBJECT *X509_OBJECT_retrieve_match(STACK_OF(X509_OBJECT) *h,
                                                X509_OBJECT *x) {
-  sk_X509_OBJECT_sort(h);
+  // This is only used to reject duplicates in `x509_store_add`. Do not sort
+  // here: re-sorting on every insertion makes populating a store with N
+  // certificates cost O(N^2 log N) comparisons. The lookup functions sort
+  // lazily before they binary search. If the stack is not yet sorted,
+  // `sk_X509_OBJECT_find` does a linear scan and matching entries may be
+  // anywhere after `idx` rather than contiguous.
+  const bool sorted = sk_X509_OBJECT_is_sorted(h);
   size_t idx;
   if (!sk_X509_OBJECT_find(h, &idx, x)) {
     return nullptr;
@@ -469,7 +479,10 @@ static X509_OBJECT *X509_OBJECT_retrieve_match(STACK_OF(X509_OBJECT) *h,
   for (size_t i = idx; i < sk_X509_OBJECT_num(h); i++) {
     X509_OBJECT *obj = sk_X509_OBJECT_value(h, i);
     if (x509_object_cmp(obj, x)) {
-      return nullptr;
+      if (sorted) {
+        return nullptr;
+      }
+      continue;
     }
     if (x->type == X509_LU_X509) {
       if (!X509_cmp(obj->data.x509, x->data.x509)) {
@@ -484,6 +497,182 @@ static X509_OBJECT *X509_OBJECT_retrieve_match(STACK_OF(X509_OBJECT) *h,
     }
   }
   return nullptr;
+}
+
+// Lazily-parsed trust anchors.
+
+X509LazyCertSet::X509LazyCertSet() : RefCounted(CheckSubClass()) {}
+
+X509LazyCertSet::~X509LazyCertSet() {
+  for (size_t i = 0; i < certs_.size(); i++) {
+    X509_free(certs_[i].x509.load());
+  }
+}
+
+// x509_cert_subject sets `out` to the subject Name TLV of the DER Certificate
+// in `cbs`, without parsing anything else.
+static bool x509_cert_subject(CBS cbs, CBS *out) {
+  CBS cert, tbs;
+  if (!CBS_get_asn1(&cbs, &cert, CBS_ASN1_SEQUENCE) ||  //
+      CBS_len(&cbs) != 0 ||                             //
+      !CBS_get_asn1(&cert, &tbs, CBS_ASN1_SEQUENCE) ||
+      // version
+      !CBS_get_optional_asn1(
+          &tbs, nullptr, nullptr,
+          CBS_ASN1_CONTEXT_SPECIFIC | CBS_ASN1_CONSTRUCTED | 0) ||
+      // serialNumber
+      !CBS_get_asn1(&tbs, nullptr, CBS_ASN1_INTEGER) ||
+      // signature
+      !CBS_get_asn1(&tbs, nullptr, CBS_ASN1_SEQUENCE) ||
+      // issuer
+      !CBS_get_asn1(&tbs, nullptr, CBS_ASN1_SEQUENCE) ||
+      // validity
+      !CBS_get_asn1(&tbs, nullptr, CBS_ASN1_SEQUENCE) ||
+      // subject
+      !CBS_get_asn1_element(&tbs, out, CBS_ASN1_SEQUENCE)) {
+    return false;
+  }
+  return true;
+}
+
+static int x509_canon_cmp(Span<const uint8_t> a, Span<const uint8_t> b) {
+  if (a.size() != b.size()) {
+    return a.size() < b.size() ? -1 : 1;
+  }
+  return OPENSSL_memcmp(a.data(), b.data(), a.size());
+}
+
+bool X509LazyCertSet::Init(const uint8_t *const *certs, const size_t *cert_lens,
+                           size_t num) {
+  if (!certs_.Init(num) || !by_subject_.Init(num)) {
+    return false;
+  }
+  for (size_t i = 0; i < num; i++) {
+    certs_[i].der = certs[i];
+    certs_[i].der_len = cert_lens[i];
+    CBS cbs, subject;
+    CBS_init(&cbs, certs[i], cert_lens[i]);
+    if (!x509_cert_subject(cbs, &subject) ||
+        !x509_name_canon_from_der(&subject, &certs_[i].canon)) {
+      OPENSSL_PUT_ERROR(X509, X509_R_INVALID_PARAMETER);
+      return false;
+    }
+    by_subject_[i] = i;
+  }
+  std::sort(by_subject_.begin(), by_subject_.end(), [&](size_t a, size_t b) {
+    return x509_canon_cmp(certs_[a].canon, certs_[b].canon) < 0;
+  });
+  return true;
+}
+
+X509 *X509LazyCertSet::Get(size_t idx) {
+  if (idx >= certs_.size()) {
+    return nullptr;
+  }
+  X509LazyCert &cert = certs_[idx];
+  X509 *x509 = cert.x509.load();
+  if (x509 != nullptr) {
+    return x509;
+  }
+  UniquePtr<CRYPTO_BUFFER> buf(
+      CRYPTO_BUFFER_new_from_static_data_unsafe(cert.der, cert.der_len, nullptr));
+  if (buf == nullptr) {
+    return nullptr;
+  }
+  UniquePtr<X509> parsed(X509_parse_from_buffer(buf.get()));
+  if (parsed == nullptr) {
+    return nullptr;
+  }
+  X509 *expected = nullptr;
+  if (cert.x509.compare_exchange_strong(expected, parsed.get())) {
+    return parsed.release();
+  }
+  // Another thread won the race; use its copy.
+  return expected;
+}
+
+bool X509LazyCertSet::AddMatchesToStore(X509Store *store,
+                                        const X509_NAME *name) {
+  const X509NameCache *cache = x509_name_get_cache(name);
+  if (cache == nullptr) {
+    return false;
+  }
+  Span<const uint8_t> canon = cache->canon;
+  // Find the first entry whose subject is not less than `canon`.
+  size_t lo = 0, hi = by_subject_.size();
+  while (lo < hi) {
+    size_t mid = lo + (hi - lo) / 2;
+    if (x509_canon_cmp(certs_[by_subject_[mid]].canon, canon) < 0) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
+  }
+  for (size_t i = lo; i < by_subject_.size(); i++) {
+    size_t idx = by_subject_[i];
+    if (x509_canon_cmp(certs_[idx].canon, canon) != 0) {
+      break;
+    }
+    X509 *x509 = Get(idx);
+    if (x509 == nullptr ||
+        !x509_store_add(store, x509, /*is_crl=*/0)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+void X509Store::MaterializeLazy(int type, const X509_NAME *name) {
+  if (type != X509_LU_X509) {
+    return;
+  }
+  for (const auto &set : lazy_cert_sets) {
+    if (!set->AddMatchesToStore(this, name)) {
+      // An anchor that fails to parse is treated as absent, as a lookup method
+      // that fails is.
+      ERR_clear_error();
+    }
+  }
+}
+
+X509_LAZY_CERT_SET *X509_LAZY_CERT_SET_new_static(const uint8_t *const *certs,
+                                                   const size_t *cert_lens,
+                                                   size_t num_certs) {
+  UniquePtr<X509LazyCertSet> set(New<X509LazyCertSet>());
+  if (set == nullptr || !set->Init(certs, cert_lens, num_certs)) {
+    return nullptr;
+  }
+  return set.release();
+}
+
+int X509_LAZY_CERT_SET_up_ref(X509_LAZY_CERT_SET *set) {
+  FromOpaque(set)->UpRefInternal();
+  return 1;
+}
+
+void X509_LAZY_CERT_SET_free(X509_LAZY_CERT_SET *set) {
+  if (set != nullptr) {
+    FromOpaque(set)->DecRefInternal();
+  }
+}
+
+size_t X509_LAZY_CERT_SET_num(const X509_LAZY_CERT_SET *set) {
+  return FromOpaque(set)->size();
+}
+
+X509 *X509_LAZY_CERT_SET_get0(X509_LAZY_CERT_SET *set, size_t idx) {
+  return FromOpaque(set)->Get(idx);
+}
+
+int X509_STORE_add_lazy_cert_set(X509_STORE *store, X509_LAZY_CERT_SET *set) {
+  X509Store *impl = FromOpaque(store);
+  MutexWriteLock lock(&impl->objs_lock);
+  for (const auto &existing : impl->lazy_cert_sets) {
+    if (existing.get() == FromOpaque(set)) {
+      return 1;
+    }
+  }
+  return impl->lazy_cert_sets.Push(UpRef(FromOpaque(set))) ? 1 : 0;
 }
 
 int X509_STORE_CTX_get1_issuer(X509 **out_issuer, X509_STORE_CTX *ctx,

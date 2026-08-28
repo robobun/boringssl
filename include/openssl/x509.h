@@ -2819,6 +2819,43 @@ OPENSSL_EXPORT void X509_STORE_free(X509_STORE *store);
 // `X509_verify_cert` call.
 OPENSSL_EXPORT int X509_STORE_add_cert(X509_STORE *store, X509 *x509);
 
+// X509_LAZY_CERT_SET_new_static returns a newly-allocated set of the
+// `num_certs` DER-encoded certificates in `certs` and `cert_lens`, or NULL on
+// error. The certificates are not parsed until they are needed for an issuer
+// lookup or requested with `X509_LAZY_CERT_SET_get0`, so a large set of trust
+// anchors costs almost nothing until a verification actually names one of
+// them. The memory behind each certificate must remain valid and unmodified
+// for the lifetime of the process; it is neither copied nor freed.
+OPENSSL_EXPORT X509_LAZY_CERT_SET *X509_LAZY_CERT_SET_new_static(
+    const uint8_t *const *certs, const size_t *cert_lens, size_t num_certs);
+
+// X509_LAZY_CERT_SET_up_ref adds one to the reference count of `set` and
+// returns one.
+OPENSSL_EXPORT int X509_LAZY_CERT_SET_up_ref(X509_LAZY_CERT_SET *set);
+
+// X509_LAZY_CERT_SET_free releases a reference to `set`.
+OPENSSL_EXPORT void X509_LAZY_CERT_SET_free(X509_LAZY_CERT_SET *set);
+
+// X509_LAZY_CERT_SET_num returns the number of certificates in `set`.
+OPENSSL_EXPORT size_t X509_LAZY_CERT_SET_num(const X509_LAZY_CERT_SET *set);
+
+// X509_LAZY_CERT_SET_get0 returns the `idx`th certificate in `set`, parsing it
+// on first use, or NULL on error. The result is owned by `set`. This function
+// is thread-safe.
+OPENSSL_EXPORT X509 *X509_LAZY_CERT_SET_get0(X509_LAZY_CERT_SET *set,
+                                             size_t idx);
+
+// X509_STORE_add_lazy_cert_set configures `store` to trust every certificate
+// in `set`, exactly as if each had been passed to `X509_STORE_add_cert`, except
+// that a certificate is only parsed and added to `store`'s object cache the
+// first time a lookup names its subject. It returns one on success and zero on
+// error. `store` takes a reference to `set`.
+//
+// `X509_STORE_get0_objects` and `X509_STORE_get1_objects` only report
+// certificates from `set` that have already been looked up.
+OPENSSL_EXPORT int X509_STORE_add_lazy_cert_set(X509_STORE *store,
+                                                X509_LAZY_CERT_SET *set);
+
 // X509_STORE_add_crl adds `crl` to `store`. It returns one on success and zero
 // on error. This function internally increments `crl`'s reference count, so the
 // caller retains ownership of `crl`. CRLs added in this way are candidates for
@@ -5343,6 +5380,8 @@ BORINGSSL_MAKE_DELETER(X509_PUBKEY, X509_PUBKEY_free)
 BORINGSSL_MAKE_DELETER(X509_REQ, X509_REQ_free)
 BORINGSSL_MAKE_DELETER(X509_REVOKED, X509_REVOKED_free)
 BORINGSSL_MAKE_DELETER(X509_SIG, X509_SIG_free)
+BORINGSSL_MAKE_DELETER(X509_LAZY_CERT_SET, X509_LAZY_CERT_SET_free)
+BORINGSSL_MAKE_UP_REF(X509_LAZY_CERT_SET, X509_LAZY_CERT_SET_up_ref)
 BORINGSSL_MAKE_DELETER(X509_STORE, X509_STORE_free)
 BORINGSSL_MAKE_UP_REF(X509_STORE, X509_STORE_up_ref)
 BORINGSSL_MAKE_DELETER(X509_STORE_CTX, X509_STORE_CTX_free)

@@ -361,6 +361,7 @@ typedef struct x509_purpose_st X509_PURPOSE;
 typedef struct x509_revoked_st X509_REVOKED;
 typedef struct x509_st X509;
 typedef struct x509_store_ctx_st X509_STORE_CTX;
+typedef struct x509_lazy_cert_set_st X509_LAZY_CERT_SET;
 typedef struct x509_store_st X509_STORE;
 
 typedef void *OPENSSL_BLOCK;

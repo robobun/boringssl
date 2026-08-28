@@ -307,10 +307,16 @@ IMPLEMENT_EXTERN_ASN1_PARSE_INTO(X509_NAME, X509_NAME_new, X509_NAME_free,
                                  CBS_ASN1_SEQUENCE, x509_parse_name,
                                  x509_marshal_name)
 
-static int asn1_marshal_string_canon(CBB *cbb, const ASN1_STRING *in) {
+// asn1_marshal_string_canon_contents writes the canonical form of a string of
+// ASN.1 type `type` with contents `data` to `cbb`. It returns one on success,
+// zero on error, and -1 if `type` is not a type that is canonicalized, in
+// which case nothing is written.
+static int asn1_marshal_string_canon_contents(CBB *cbb, int type,
+                                               const uint8_t *data,
+                                               size_t len) {
   int (*decode_func)(CBS *, uint32_t *);
   int error;
-  switch (in->type) {
+  switch (type) {
     case V_ASN1_UTF8STRING:
       decode_func = CBS_get_utf8;
       error = ASN1_R_INVALID_UTF8STRING;
@@ -332,7 +338,7 @@ static int asn1_marshal_string_canon(CBB *cbb, const ASN1_STRING *in) {
       break;
     default:
       // Other string types are not canonicalized.
-      return asn1_marshal_any_string(cbb, in);
+      return -1;
   }
 
   CBB child;
@@ -343,7 +349,7 @@ static int asn1_marshal_string_canon(CBB *cbb, const ASN1_STRING *in) {
   bool empty = true;
   bool in_whitespace = false;
   CBS cbs;
-  CBS_init(&cbs, in->data, in->length);
+  CBS_init(&cbs, data, len);
   while (CBS_len(&cbs) != 0) {
     uint32_t c;
     if (!decode_func(&cbs, &c)) {
@@ -375,6 +381,70 @@ static int asn1_marshal_string_canon(CBB *cbb, const ASN1_STRING *in) {
   }
 
   return CBB_flush(cbb);
+}
+
+static int asn1_marshal_string_canon(CBB *cbb, const ASN1_STRING *in) {
+  int ret = asn1_marshal_string_canon_contents(cbb, in->type, in->data,
+                                                static_cast<size_t>(in->length));
+  if (ret >= 0) {
+    return ret;
+  }
+  return asn1_marshal_any_string(cbb, in);
+}
+
+int bssl::x509_name_canon_from_der(CBS *cbs, Array<uint8_t> *out) {
+  // This mirrors `x509_marshal_name_entries` with `canonicalize` set, reading
+  // the entries from DER instead of an `X509_NAME`, so that the output is
+  // byte-for-byte what `X509_NAME_cmp` compares.
+  CBS name;
+  if (!CBS_get_asn1(cbs, &name, CBS_ASN1_SEQUENCE)) {
+    return 0;
+  }
+  ScopedCBB cbb;
+  if (!CBB_init(cbb.get(), CBS_len(&name) + 16)) {
+    return 0;
+  }
+  while (CBS_len(&name) != 0) {
+    CBS rdn;
+    CBB rdn_cbb;
+    if (!CBS_get_asn1(&name, &rdn, CBS_ASN1_SET) ||  //
+        CBS_len(&rdn) == 0 ||
+        !CBB_add_asn1(cbb.get(), &rdn_cbb, CBS_ASN1_SET)) {
+      return 0;
+    }
+    while (CBS_len(&rdn) != 0) {
+      CBS entry, oid, value;
+      CBS_ASN1_TAG tag;
+      size_t header_len;
+      CBB seq;
+      if (!CBS_get_asn1(&rdn, &entry, CBS_ASN1_SEQUENCE) ||
+          !CBS_get_asn1_element(&entry, &oid, CBS_ASN1_OBJECT) ||
+          !CBS_get_any_asn1_element(&entry, &value, &tag, &header_len) ||
+          CBS_len(&entry) != 0 ||
+          !CBB_add_asn1(&rdn_cbb, &seq, CBS_ASN1_SEQUENCE) ||
+          !CBB_add_bytes(&seq, CBS_data(&oid), CBS_len(&oid))) {
+        return 0;
+      }
+      int ret = -1;
+      // Universal, primitive string types have tag numbers equal to their
+      // `V_ASN1_*` constants.
+      if ((tag & ~CBS_ASN1_TAG_NUMBER_MASK) == 0) {
+        ret = asn1_marshal_string_canon_contents(
+            &seq, static_cast<int>(tag), CBS_data(&value) + header_len,
+            CBS_len(&value) - header_len);
+      }
+      if (ret < 0) {
+        ret = CBB_add_bytes(&seq, CBS_data(&value), CBS_len(&value));
+      }
+      if (!ret || !CBB_flush(&rdn_cbb)) {
+        return 0;
+      }
+    }
+    if (!CBB_flush_asn1_set_of(&rdn_cbb) || !CBB_flush(cbb.get())) {
+      return 0;
+    }
+  }
+  return CBBFinishArray(cbb.get(), out);
 }
 
 int X509_NAME_set(X509_NAME **xn, const X509_NAME *name) {
