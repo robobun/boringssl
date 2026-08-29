@@ -542,16 +542,14 @@ static int x509_canon_cmp(Span<const uint8_t> a, Span<const uint8_t> b) {
   return OPENSSL_memcmp(a.data(), b.data(), a.size());
 }
 
-bool X509LazyCertSet::Init(const uint8_t *const *certs, const size_t *cert_lens,
-                           size_t num) {
+bool X509LazyCertSet::Init(CRYPTO_BUFFER *const *certs, size_t num) {
   if (!certs_.Init(num) || !by_subject_.Init(num)) {
     return false;
   }
   for (size_t i = 0; i < num; i++) {
-    certs_[i].der = certs[i];
-    certs_[i].der_len = cert_lens[i];
+    certs_[i].der = UpRef(certs[i]);
     CBS cbs, subject;
-    CBS_init(&cbs, certs[i], cert_lens[i]);
+    CRYPTO_BUFFER_init_CBS(certs[i], &cbs);
     if (!x509_cert_subject(cbs, &subject) ||
         !x509_name_canon_from_der(&subject, &certs_[i].canon)) {
       OPENSSL_PUT_ERROR(X509, X509_R_INVALID_PARAMETER);
@@ -574,12 +572,7 @@ X509 *X509LazyCertSet::Get(size_t idx) {
   if (x509 != nullptr) {
     return x509;
   }
-  UniquePtr<CRYPTO_BUFFER> buf(
-      CRYPTO_BUFFER_new_from_static_data_unsafe(cert.der, cert.der_len, nullptr));
-  if (buf == nullptr) {
-    return nullptr;
-  }
-  UniquePtr<X509> parsed(X509_parse_from_buffer(buf.get()));
+  UniquePtr<X509> parsed(X509_parse_from_buffer(cert.der.get()));
   if (parsed == nullptr) {
     return nullptr;
   }
@@ -635,14 +628,29 @@ void X509Store::MaterializeLazy(int type, const X509_NAME *name) {
   }
 }
 
-X509_LAZY_CERT_SET *X509_LAZY_CERT_SET_new_static(const uint8_t *const *certs,
-                                                   const size_t *cert_lens,
-                                                   size_t num_certs) {
+X509_LAZY_CERT_SET *X509_LAZY_CERT_SET_new(CRYPTO_BUFFER *const *certs,
+                                            size_t num_certs) {
   UniquePtr<X509LazyCertSet> set(New<X509LazyCertSet>());
-  if (set == nullptr || !set->Init(certs, cert_lens, num_certs)) {
+  if (set == nullptr || !set->Init(certs, num_certs)) {
     return nullptr;
   }
   return set.release();
+}
+
+X509_LAZY_CERT_SET *X509_LAZY_CERT_SET_new_static(const uint8_t *const *certs,
+                                                   const size_t *cert_lens,
+                                                   size_t num_certs) {
+  Vector<UniquePtr<CRYPTO_BUFFER>> owned;
+  Vector<CRYPTO_BUFFER *> bufs;
+  for (size_t i = 0; i < num_certs; i++) {
+    UniquePtr<CRYPTO_BUFFER> buf(CRYPTO_BUFFER_new_from_static_data_unsafe(
+        certs[i], cert_lens[i], nullptr));
+    if (buf == nullptr || !bufs.Push(buf.get()) ||
+        !owned.Push(std::move(buf))) {
+      return nullptr;
+    }
+  }
+  return X509_LAZY_CERT_SET_new(bufs.data(), num_certs);
 }
 
 int X509_LAZY_CERT_SET_up_ref(X509_LAZY_CERT_SET *set) {

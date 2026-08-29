@@ -2819,13 +2819,19 @@ OPENSSL_EXPORT void X509_STORE_free(X509_STORE *store);
 // `X509_verify_cert` call.
 OPENSSL_EXPORT int X509_STORE_add_cert(X509_STORE *store, X509 *x509);
 
-// X509_LAZY_CERT_SET_new_static returns a newly-allocated set of the
-// `num_certs` DER-encoded certificates in `certs` and `cert_lens`, or NULL on
-// error. The certificates are not parsed until they are needed for an issuer
-// lookup or requested with `X509_LAZY_CERT_SET_get0`, so a large set of trust
-// anchors costs almost nothing until a verification actually names one of
-// them. The memory behind each certificate must remain valid and unmodified
-// for the lifetime of the process; it is neither copied nor freed.
+// X509_LAZY_CERT_SET_new returns a newly-allocated set of the `num_certs`
+// DER-encoded certificates in `certs`, or NULL on error. It takes a reference
+// to each buffer. The certificates are not parsed until they are needed for an
+// issuer lookup or requested with `X509_LAZY_CERT_SET_get0`, so a large set of
+// trust anchors costs almost nothing until a verification actually names one
+// of them.
+OPENSSL_EXPORT X509_LAZY_CERT_SET *X509_LAZY_CERT_SET_new(
+    CRYPTO_BUFFER *const *certs, size_t num_certs);
+
+// X509_LAZY_CERT_SET_new_static behaves like `X509_LAZY_CERT_SET_new` over
+// `CRYPTO_BUFFER_new_from_static_data_unsafe` buffers: the memory behind each
+// certificate must remain valid and unmodified for the lifetime of the process;
+// it is neither copied nor freed.
 OPENSSL_EXPORT X509_LAZY_CERT_SET *X509_LAZY_CERT_SET_new_static(
     const uint8_t *const *certs, const size_t *cert_lens, size_t num_certs);
 

@@ -369,8 +369,7 @@ struct x509_lookup_method_st {
 BSSL_NAMESPACE_BEGIN
 
 struct X509LazyCert {
-  const uint8_t *der = nullptr;
-  size_t der_len = 0;
+  UniquePtr<CRYPTO_BUFFER> der;
   // canon is the subject in the form `X509_NAME_cmp` compares.
   Array<uint8_t> canon;
   Atomic<X509 *> x509 = nullptr;
@@ -381,9 +380,10 @@ class X509LazyCertSet : public x509_lazy_cert_set_st,
  public:
   X509LazyCertSet();
 
-  // Init indexes `num` certificates by subject without parsing them. It
-  // returns false if any is not a well-formed Certificate.
-  bool Init(const uint8_t *const *certs, const size_t *cert_lens, size_t num);
+  // Init takes a reference to each of `certs` and indexes them by subject
+  // without parsing them. It returns false if any is not a well-formed
+  // Certificate.
+  bool Init(CRYPTO_BUFFER *const *certs, size_t num);
 
   size_t size() const { return certs_.size(); }
 

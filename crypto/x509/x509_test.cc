@@ -11930,6 +11930,24 @@ TEST(X509Test, LazyCertSet) {
                                          {intermediate.get()}));
   }
 
+  // The owning constructor keeps the buffers alive itself.
+  {
+    std::vector<uint8_t> der = CertToDER(root.get());
+    UniquePtr<CRYPTO_BUFFER> buf(
+        CRYPTO_BUFFER_new(der.data(), der.size(), nullptr));
+    ASSERT_TRUE(buf);
+    CRYPTO_BUFFER *bufs[] = {buf.get()};
+    UniquePtr<X509_LAZY_CERT_SET> owned(X509_LAZY_CERT_SET_new(bufs, 1));
+    ASSERT_TRUE(owned);
+    buf.reset();
+    der.assign(der.size(), 0);
+    UniquePtr<X509_STORE> store5(X509_STORE_new());
+    ASSERT_TRUE(store5);
+    ASSERT_TRUE(X509_STORE_add_lazy_cert_set(store5.get(), owned.get()));
+    EXPECT_EQ(X509_V_OK, VerifyWithStore(leaf.get(), store5.get(),
+                                         {intermediate.get()}));
+  }
+
   // Malformed input is rejected up front rather than at lookup time.
   static const uint8_t kTruncated[] = {0x30, 0x03, 0x30, 0x01};
   const uint8_t *bad_ptr = kTruncated;
