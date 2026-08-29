@@ -84,6 +84,12 @@ class X509NameEntry : public X509_name_entry_st {
 // (RFC 5280) and C type is `X509_NAME_ENTRY*`.
 DECLARE_ASN1_ITEM(X509_NAME_ENTRY)
 
+// x509_verify_trusted_cert_in_time returns zero if `ctx` has
+// `X509_V_FLAG_IGNORE_EXPIRED_TRUST_ANCHORS` set and `x509`'s validity period
+// does not cover `ctx`'s verification time, and one otherwise.
+int x509_verify_trusted_cert_in_time(const X509_STORE_CTX *ctx,
+                                     const X509 *x509);
+
 // x509_name_canon_from_der parses a DER-encoded Name from `cbs` and sets `out`
 // to its canonical form, as `X509_NAME_cmp` would compare it, without
 // constructing an `X509_NAME`. It returns one on success and zero on error.

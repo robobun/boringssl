@@ -410,6 +410,9 @@ STACK_OF(X509) *X509_STORE_CTX_get1_certs(X509_STORE_CTX *ctx,
   for (int i = 0; i < cnt; i++, idx++) {
     X509_OBJECT *obj = sk_X509_OBJECT_value(store->objs.get(), idx);
     X509 *x = obj->data.x509;
+    if (!x509_verify_trusted_cert_in_time(ctx, x)) {
+      continue;
+    }
     if (!sk_X509_push(sk, x)) {
       store->objs_lock.UnlockWrite();
       sk_X509_pop_free(sk, X509_free);
@@ -741,7 +744,8 @@ int X509_STORE_CTX_get1_issuer(X509 **out_issuer, X509_STORE_CTX *ctx,
     return 0;
   }
   // If certificate matches all OK
-  if (x509_check_issued_with_callback(ctx, x, obj.data.x509)) {
+  if (x509_check_issued_with_callback(ctx, x, obj.data.x509) &&
+      x509_verify_trusted_cert_in_time(ctx, obj.data.x509)) {
     *out_issuer = obj.data.x509;
     return 1;
   }
@@ -766,7 +770,8 @@ int X509_STORE_CTX_get1_issuer(X509 **out_issuer, X509_STORE_CTX *ctx,
       if (X509_NAME_cmp(xn, X509_get_subject_name(pobj->data.x509))) {
         return 0;
       }
-      if (x509_check_issued_with_callback(ctx, x, pobj->data.x509)) {
+      if (x509_check_issued_with_callback(ctx, x, pobj->data.x509) &&
+          x509_verify_trusted_cert_in_time(ctx, pobj->data.x509)) {
         *out_issuer = pobj->data.x509;
         X509_OBJECT_up_ref_count(pobj);
         return 1;

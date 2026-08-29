@@ -383,11 +383,31 @@ static X509 *find_issuer(X509_STORE_CTX *ctx, STACK_OF(X509) *sk, X509 *x) {
   X509 *issuer;
   for (i = 0; i < sk_X509_num(sk); i++) {
     issuer = sk_X509_value(sk, i);
-    if (x509_check_issued_with_callback(ctx, x, issuer)) {
+    if (x509_check_issued_with_callback(ctx, x, issuer) &&
+        (sk != ctx->trusted_stack ||
+         x509_verify_trusted_cert_in_time(ctx, issuer))) {
       return issuer;
     }
   }
   return nullptr;
+}
+
+int bssl::x509_verify_trusted_cert_in_time(const X509_STORE_CTX *ctx,
+                                           const X509 *x509) {
+  if (!(ctx->param->flags & X509_V_FLAG_IGNORE_EXPIRED_TRUST_ANCHORS) ||
+      (ctx->param->flags & X509_V_FLAG_NO_CHECK_TIME)) {
+    return 1;
+  }
+  int64_t ptime = (ctx->param->flags & X509_V_FLAG_USE_CHECK_TIME)
+                      ? ctx->param->check_time
+                      : time(nullptr);
+  auto cmp = [&](const ASN1_TIME *t) {
+    return (ctx->param->flags & X509_V_FLAG_ALLOW_TIMEZONE_OFFSET)
+               ? X509_cmp_time_posix_nonstandard(t, ptime)
+               : X509_cmp_time_posix(t, ptime);
+  };
+  // As `check_cert_time`: notBefore must compare earlier, notAfter later.
+  return cmp(X509_get0_notBefore(x509)) < 0 && cmp(X509_get0_notAfter(x509)) > 0;
 }
 
 // Given a possible certificate and issuer check them

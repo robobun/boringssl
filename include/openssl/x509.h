@@ -3356,6 +3356,16 @@ OPENSSL_EXPORT int X509_VERIFY_PARAM_set1(X509_VERIFY_PARAM *to,
 // X509_V_FLAG_USE_MTC_DRAFT_PLANTS_05 enables the verification of Merkle Tree
 // Certificates as specified in draft-ietf-plants-merkle-tree-certs-05.
 #define X509_V_FLAG_USE_MTC_DRAFT_PLANTS_05 0x400000
+// X509_V_FLAG_IGNORE_EXPIRED_TRUST_ANCHORS makes chain building treat a
+// certificate from the trust store (or `X509_STORE_CTX_set0_trusted_stack`)
+// whose validity period does not cover the verification time as if it were
+// not there, so it can neither anchor a chain nor shadow a currently-valid
+// certificate for the same issuer supplied by the peer or elsewhere in the
+// store. A chain that could only have been built through such a certificate
+// then fails as untrusted (e.g. `X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY`)
+// rather than `X509_V_ERR_CERT_HAS_EXPIRED`. Untrusted (peer) certificates are
+// unaffected. Has no effect with `X509_V_FLAG_NO_CHECK_TIME`.
+#define X509_V_FLAG_IGNORE_EXPIRED_TRUST_ANCHORS 0x2000000
 
 // X509_VERIFY_PARAM_set_flags enables all values in `flags` in `param`'s
 // verification flags and returns one. `flags` should be a combination of

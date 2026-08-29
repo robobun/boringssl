@@ -12031,6 +12031,76 @@ TEST(X509Test, LazyCertSetThreads) {
 }
 #endif
 
+// X509_V_FLAG_IGNORE_EXPIRED_TRUST_ANCHORS: an expired certificate in the trust
+// store is treated as absent — it can neither shadow a currently-valid
+// certificate for the same issuer (Windows caches expired AIA-fetched
+// intermediates in the store --use-system-ca reads) nor anchor a chain.
+TEST(X509Test, IgnoreExpiredTrustAnchors) {
+  UniquePtr<EVP_PKEY> root_key = PrivateKeyFromPEM(kP256Key);
+  UniquePtr<EVP_PKEY> int_key = PrivateKeyFromPEM(kRSAKey);
+  UniquePtr<EVP_PKEY> leaf_key = PrivateKeyFromPEM(kP256Key);
+  ASSERT_TRUE(root_key && int_key && leaf_key);
+
+  UniquePtr<X509> root = MakeTestCert("Root", "Root", root_key.get(), /*is_ca=*/true);
+  ASSERT_TRUE(root && X509_sign(root.get(), root_key.get(), EVP_sha256()));
+  UniquePtr<X509> root_old = MakeTestCert("Root", "Root", root_key.get(), /*is_ca=*/true);
+  ASSERT_TRUE(root_old);
+  ASSERT_TRUE(ASN1_TIME_adj(X509_getm_notBefore(root_old.get()), kReferenceTime, -730, 0));
+  ASSERT_TRUE(ASN1_TIME_adj(X509_getm_notAfter(root_old.get()), kReferenceTime, -365, 0));
+  ASSERT_TRUE(X509_sign(root_old.get(), root_key.get(), EVP_sha256()));
+  // Same subject and key; one expired a year before kReferenceTime.
+  UniquePtr<X509> int_new = MakeTestCert("Root", "Intermediate", int_key.get(), /*is_ca=*/true);
+  UniquePtr<X509> int_old = MakeTestCert("Root", "Intermediate", int_key.get(), /*is_ca=*/true);
+  ASSERT_TRUE(int_new && int_old);
+  ASSERT_TRUE(ASN1_INTEGER_set_uint64(X509_get_serialNumber(int_old.get()), 41));
+  ASSERT_TRUE(ASN1_TIME_adj(X509_getm_notBefore(int_old.get()), kReferenceTime, -730, 0));
+  ASSERT_TRUE(ASN1_TIME_adj(X509_getm_notAfter(int_old.get()), kReferenceTime, -365, 0));
+  ASSERT_TRUE(X509_sign(int_new.get(), root_key.get(), EVP_sha256()));
+  ASSERT_TRUE(X509_sign(int_old.get(), root_key.get(), EVP_sha256()));
+  UniquePtr<X509> leaf = MakeTestCert("Intermediate", "Leaf", leaf_key.get(), /*is_ca=*/false);
+  ASSERT_TRUE(leaf && X509_sign(leaf.get(), int_key.get(), EVP_sha256()));
+
+  const unsigned long kFlag = X509_V_FLAG_IGNORE_EXPIRED_TRUST_ANCHORS;
+  struct {
+    std::vector<X509 *> trusted, untrusted;
+    int without_flag, with_flag;
+  } kCases[] = {
+      // Nothing expired: unchanged.
+      {{root.get()}, {int_new.get()}, X509_V_OK, X509_V_OK},
+      // Expired intermediate from the *peer*: still expired (only trust anchors are ignored).
+      {{root.get()}, {int_old.get()}, X509_V_ERR_CERT_HAS_EXPIRED, X509_V_ERR_CERT_HAS_EXPIRED},
+      // Expired intermediate trusted, peer sends the valid one: it no longer shadows it.
+      {{root.get(), int_old.get()}, {int_new.get()}, X509_V_ERR_CERT_HAS_EXPIRED, X509_V_OK},
+      // Both trusted, either order: the valid one is found.
+      {{root.get(), int_old.get(), int_new.get()}, {}, X509_V_ERR_CERT_HAS_EXPIRED, X509_V_OK},
+      {{root.get(), int_new.get(), int_old.get()}, {}, X509_V_OK, X509_V_OK},
+      // Only the expired intermediate trusted, nothing valid anywhere: absent, so untrusted.
+      {{root.get(), int_old.get()}, {}, X509_V_ERR_CERT_HAS_EXPIRED, X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY},
+      // Expired root: absent, so the chain is incomplete rather than expired.
+      {{root_old.get()}, {int_new.get()}, X509_V_ERR_CERT_HAS_EXPIRED, X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY},
+      // Expired and valid root both trusted: valid one anchors.
+      {{root_old.get(), root.get()}, {int_new.get()}, X509_V_ERR_CERT_HAS_EXPIRED, X509_V_OK},
+  };
+  int i = 0;
+  for (const auto &t : kCases) {
+    SCOPED_TRACE(i++);
+    EXPECT_EQ(t.without_flag, Verify(leaf.get(), t.trusted, t.untrusted, {}));
+    EXPECT_EQ(t.with_flag, Verify(leaf.get(), t.trusted, t.untrusted, {}, kFlag));
+    // The same through an X509_STORE rather than a trusted stack.
+    UniquePtr<X509_STORE> store(X509_STORE_new());
+    ASSERT_TRUE(store);
+    for (X509 *cert : t.trusted) {
+      ASSERT_TRUE(X509_STORE_add_cert(store.get(), cert));
+    }
+    EXPECT_EQ(t.without_flag, VerifyWithStore(leaf.get(), store.get(), t.untrusted));
+    ASSERT_TRUE(X509_STORE_set_flags(store.get(), kFlag));
+    EXPECT_EQ(t.with_flag, VerifyWithStore(leaf.get(), store.get(), t.untrusted));
+  }
+  // X509_V_FLAG_NO_CHECK_TIME wins.
+  EXPECT_EQ(X509_V_OK, Verify(leaf.get(), {root_old.get()}, {int_new.get()}, {},
+                              kFlag | X509_V_FLAG_NO_CHECK_TIME));
+}
+
 // Populating a store must not re-sort on every insertion, but duplicates must
 // still be rejected and lookups must still find every match.
 TEST(X509Test, StoreAddManyThenLookup) {
