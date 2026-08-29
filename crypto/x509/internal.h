@@ -370,6 +370,8 @@ BSSL_NAMESPACE_BEGIN
 
 struct X509LazyCert {
   UniquePtr<CRYPTO_BUFFER> der;
+  // subject is the Name TLV within `der`.
+  Span<const uint8_t> subject;
   // canon is the subject in the form `X509_NAME_cmp` compares.
   Array<uint8_t> canon;
   Atomic<X509 *> x509 = nullptr;
@@ -391,6 +393,9 @@ class X509LazyCertSet : public x509_lazy_cert_set_st,
   X509 *Get(size_t idx);
   const CRYPTO_BUFFER *GetDER(size_t idx) const {
     return idx < certs_.size() ? certs_[idx].der.get() : nullptr;
+  }
+  Span<const uint8_t> GetSubject(size_t idx) const {
+    return idx < certs_.size() ? certs_[idx].subject : Span<const uint8_t>();
   }
 
   // AddMatchesToStore parses every certificate whose subject is `name` and adds

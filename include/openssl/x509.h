@@ -2846,6 +2846,15 @@ OPENSSL_EXPORT int X509_LAZY_CERT_SET_can_index(const uint8_t *der, size_t len);
 OPENSSL_EXPORT const CRYPTO_BUFFER *X509_LAZY_CERT_SET_get0_der(
     const X509_LAZY_CERT_SET *set, size_t idx);
 
+// X509_LAZY_CERT_SET_get0_subject points `*out` and `*out_len` at the
+// DER-encoded subject Name of the `idx`th certificate in `set` (within the
+// certificate's own DER) without parsing it, e.g. for
+// `SSL_CTX_set0_client_CAs`. It returns one, or zero if `idx` is out of range.
+OPENSSL_EXPORT int X509_LAZY_CERT_SET_get0_subject(const X509_LAZY_CERT_SET *set,
+                                                   size_t idx,
+                                                   const uint8_t **out,
+                                                   size_t *out_len);
+
 // X509_LAZY_CERT_SET_up_ref adds one to the reference count of `set` and
 // returns one.
 OPENSSL_EXPORT int X509_LAZY_CERT_SET_up_ref(X509_LAZY_CERT_SET *set);

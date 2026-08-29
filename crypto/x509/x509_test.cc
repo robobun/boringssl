@@ -11953,6 +11953,17 @@ TEST(X509Test, LazyCertSet) {
   ASSERT_TRUE(der1);
   EXPECT_EQ(Bytes(ders[1]), Bytes(CRYPTO_BUFFER_data(der1), CRYPTO_BUFFER_len(der1)));
   EXPECT_EQ(nullptr, X509_LAZY_CERT_SET_get0_der(set.get(), 3));
+  {
+    const uint8_t *subject;
+    size_t subject_len;
+    ASSERT_TRUE(X509_LAZY_CERT_SET_get0_subject(set.get(), 1, &subject, &subject_len));
+    uint8_t *expected = nullptr;
+    int expected_len = i2d_X509_NAME(X509_get_subject_name(root.get()), &expected);
+    ASSERT_GT(expected_len, 0);
+    EXPECT_EQ(Bytes(expected, expected_len), Bytes(subject, subject_len));
+    OPENSSL_free(expected);
+    EXPECT_FALSE(X509_LAZY_CERT_SET_get0_subject(set.get(), 3, &subject, &subject_len));
+  }
   EXPECT_TRUE(X509_LAZY_CERT_SET_can_index(ders[0].data(), ders[0].size()));
   EXPECT_FALSE(X509_LAZY_CERT_SET_can_index(ders[0].data(), ders[0].size() - 1));
 

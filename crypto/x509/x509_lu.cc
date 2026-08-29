@@ -550,8 +550,12 @@ bool X509LazyCertSet::Init(CRYPTO_BUFFER *const *certs, size_t num) {
     certs_[i].der = UpRef(certs[i]);
     CBS cbs, subject;
     CRYPTO_BUFFER_init_CBS(certs[i], &cbs);
-    if (!x509_cert_subject(cbs, &subject) ||
-        !x509_name_canon_from_der(&subject, &certs_[i].canon)) {
+    if (!x509_cert_subject(cbs, &subject)) {
+      OPENSSL_PUT_ERROR(X509, X509_R_INVALID_PARAMETER);
+      return false;
+    }
+    certs_[i].subject = subject;
+    if (!x509_name_canon_from_der(&subject, &certs_[i].canon)) {
       OPENSSL_PUT_ERROR(X509, X509_R_INVALID_PARAMETER);
       return false;
     }
@@ -697,6 +701,17 @@ int X509_LAZY_CERT_SET_can_index(const uint8_t *der, size_t len) {
 const CRYPTO_BUFFER *X509_LAZY_CERT_SET_get0_der(const X509_LAZY_CERT_SET *set,
                                                  size_t idx) {
   return FromOpaque(set)->GetDER(idx);
+}
+
+int X509_LAZY_CERT_SET_get0_subject(const X509_LAZY_CERT_SET *set, size_t idx,
+                                    const uint8_t **out, size_t *out_len) {
+  Span<const uint8_t> subject = FromOpaque(set)->GetSubject(idx);
+  if (subject.empty()) {
+    return 0;
+  }
+  *out = subject.data();
+  *out_len = subject.size();
+  return 1;
 }
 
 size_t X509_LAZY_CERT_SET_num(const X509_LAZY_CERT_SET *set) {
