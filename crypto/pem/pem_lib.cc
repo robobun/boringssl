@@ -43,6 +43,26 @@
 using namespace bssl;
 
 static int load_iv(const char **fromp, unsigned char *to, size_t num);
+
+#if defined(BORINGSSL_PEM_FAST_PUBLIC_BASE64)
+// pem_label_is_public returns whether a PEM block labelled `name` only ever
+// carries public data, and so may bypass the constant-time base64 routines.
+static bool pem_label_is_public(std::string_view name) {
+  static const char *const kPublicLabels[] = {
+      PEM_STRING_X509,         PEM_STRING_X509_OLD,     PEM_STRING_X509_TRUSTED,
+      PEM_STRING_X509_PAIR,    PEM_STRING_X509_CRL,     PEM_STRING_X509_REQ,
+      PEM_STRING_X509_REQ_OLD, PEM_STRING_PUBLIC,       PEM_STRING_RSA_PUBLIC,
+      PEM_STRING_DSA_PUBLIC,   PEM_STRING_ECDSA_PUBLIC, PEM_STRING_DHPARAMS,
+      PEM_STRING_DSAPARAMS,
+  };
+  for (const char *label : kPublicLabels) {
+    if (name == label) {
+      return true;
+    }
+  }
+  return false;
+}
+#endif
 static bool check_pem(std::string_view name, std::string_view expected);
 
 // PEM_dek_info appends a DEK-Info header to `buf`, with an algorithm of `type`
@@ -464,25 +484,51 @@ int PEM_write_bio(BIO *bp, const char *name, const char *header,
     }
   }
 
-  buf = reinterpret_cast<uint8_t *>(OPENSSL_malloc(PEM_BUFSIZE * 8));
-  if (buf == nullptr) {
-    goto err;
-  }
-
-  i = j = 0;
-  while (len > 0) {
-    n = (int)((len > (PEM_BUFSIZE * 5)) ? (PEM_BUFSIZE * 5) : len);
-    EVP_EncodeUpdate(&ctx, buf, &outl, &(data[j]), n);
-    if ((outl) && (BIO_write(bp, (char *)buf, outl) != outl)) {
+#if defined(BORINGSSL_PEM_FAST_PUBLIC_BASE64)
+  if (pem_label_is_public(name)) {
+    size_t max_out, written;
+    // One newline per 64 output characters, and one for the final line.
+    if (len < 0 || !EVP_EncodedLength(&max_out, len) ||
+        max_out + max_out / 64 + 1 < max_out) {
       goto err;
     }
-    i += outl;
-    len -= n;
-    j += n;
-  }
-  EVP_EncodeFinal(&ctx, buf, &outl);
-  if ((outl > 0) && (BIO_write(bp, (char *)buf, outl) != outl)) {
-    goto err;
+    max_out += max_out / 64 + 1;
+    buf = reinterpret_cast<uint8_t *>(OPENSSL_malloc(max_out));
+    if (buf == nullptr) {
+      goto err;
+    }
+    written = OPENSSL_pem_public_base64_encode(reinterpret_cast<char *>(buf),
+                                               max_out, data, len);
+    if ((len > 0 && written == 0) || written > INT_MAX ||
+        BIO_write(bp, buf, static_cast<int>(written)) !=
+            static_cast<int>(written)) {
+      goto err;
+    }
+    i = static_cast<int>(written);
+    outl = 0;
+  } else  // NOLINT(readability/braces)
+#endif
+  {
+    buf = reinterpret_cast<uint8_t *>(OPENSSL_malloc(PEM_BUFSIZE * 8));
+    if (buf == nullptr) {
+      goto err;
+    }
+
+    i = j = 0;
+    while (len > 0) {
+      n = (int)((len > (PEM_BUFSIZE * 5)) ? (PEM_BUFSIZE * 5) : len);
+      EVP_EncodeUpdate(&ctx, buf, &outl, &(data[j]), n);
+      if ((outl) && (BIO_write(bp, (char *)buf, outl) != outl)) {
+        goto err;
+      }
+      i += outl;
+      len -= n;
+      j += n;
+    }
+    EVP_EncodeFinal(&ctx, buf, &outl);
+    if ((outl > 0) && (BIO_write(bp, (char *)buf, outl) != outl)) {
+      goto err;
+    }
   }
   if ((BIO_write(bp, "-----END ", 9) != 9) ||
       (BIO_write(bp, name, nlen) != nlen) ||
@@ -634,27 +680,50 @@ int bssl::PEM_read_bio_inner(BIO *bp, UniquePtr<char> *name,
     return 0;
   }
 
-  EVP_ENCODE_CTX ctx;
-  EVP_DecodeInit(&ctx);
   int decoded_length;
-  int status =
-      EVP_DecodeUpdate(&ctx, (unsigned char *)dataB->data, &decoded_length,
-                       (unsigned char *)dataB->data, bl);
-  if (status < 0) {
-    OPENSSL_PUT_ERROR(PEM, PEM_R_BAD_BASE64_DECODE);
-    return 0;
+#if defined(BORINGSSL_PEM_FAST_PUBLIC_BASE64)
+  if (pem_label_is_public(nameB->data)) {
+    // Four input bytes decode to at most three, and `bl` <= INT_MAX / 2.
+    bssl::UniquePtr<BUF_MEM> decodedB(BUF_MEM_new());
+    size_t decoded_size;
+    if (decodedB == nullptr || !BUF_MEM_grow(decodedB.get(), bl / 4 * 3 + 3)) {
+      OPENSSL_PUT_ERROR(PEM, ERR_R_MALLOC_FAILURE);
+      return 0;
+    }
+    if (!OPENSSL_pem_public_base64_decode(
+            reinterpret_cast<uint8_t *>(decodedB->data), &decoded_size,
+            decodedB->length, reinterpret_cast<const uint8_t *>(dataB->data),
+            bl)) {
+      OPENSSL_PUT_ERROR(PEM, PEM_R_BAD_BASE64_DECODE);
+      return 0;
+    }
+    decoded_length = static_cast<int>(decoded_size);
+    std::swap(dataB, decodedB);
+  } else  // NOLINT(readability/braces)
+#endif
+  {
+    EVP_ENCODE_CTX ctx;
+    EVP_DecodeInit(&ctx);
+    int status =
+        EVP_DecodeUpdate(&ctx, (unsigned char *)dataB->data, &decoded_length,
+                         (unsigned char *)dataB->data, bl);
+    if (status < 0) {
+      OPENSSL_PUT_ERROR(PEM, PEM_R_BAD_BASE64_DECODE);
+      return 0;
+    }
+    int k;
+    status = EVP_DecodeFinal(
+        &ctx, (unsigned char *)&(dataB->data[decoded_length]), &k);
+    if (status < 0) {
+      OPENSSL_PUT_ERROR(PEM, PEM_R_BAD_BASE64_DECODE);
+      return 0;
+    }
+    if (k > INT_MAX - decoded_length) {
+      OPENSSL_PUT_ERROR(PEM, ERR_R_OVERFLOW);
+      return 0;
+    }
+    decoded_length += k;
   }
-  int k;
-  status = EVP_DecodeFinal(&ctx, (unsigned char *)&(dataB->data[bl]), &k);
-  if (status < 0) {
-    OPENSSL_PUT_ERROR(PEM, PEM_R_BAD_BASE64_DECODE);
-    return 0;
-  }
-  if (k > INT_MAX - decoded_length) {
-    OPENSSL_PUT_ERROR(PEM, ERR_R_OVERFLOW);
-    return 0;
-  }
-  decoded_length += k;
 
   if (decoded_length == 0) {
     OPENSSL_PUT_ERROR(PEM, PEM_R_NO_DATA);

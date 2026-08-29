@@ -2819,6 +2819,70 @@ OPENSSL_EXPORT void X509_STORE_free(X509_STORE *store);
 // `X509_verify_cert` call.
 OPENSSL_EXPORT int X509_STORE_add_cert(X509_STORE *store, X509 *x509);
 
+// X509_LAZY_CERT_SET_new returns a newly-allocated set of the `num_certs`
+// DER-encoded certificates in `certs`, or NULL on error. It takes a reference
+// to each buffer. The certificates are not parsed until they are needed for an
+// issuer lookup or requested with `X509_LAZY_CERT_SET_get0`, so a large set of
+// trust anchors costs almost nothing until a verification actually names one
+// of them.
+OPENSSL_EXPORT X509_LAZY_CERT_SET *X509_LAZY_CERT_SET_new(
+    CRYPTO_BUFFER *const *certs, size_t num_certs);
+
+// X509_LAZY_CERT_SET_new_static behaves like `X509_LAZY_CERT_SET_new` over
+// `CRYPTO_BUFFER_new_from_static_data_unsafe` buffers: the memory behind each
+// certificate must remain valid and unmodified for the lifetime of the process;
+// it is neither copied nor freed.
+OPENSSL_EXPORT X509_LAZY_CERT_SET *X509_LAZY_CERT_SET_new_static(
+    const uint8_t *const *certs, const size_t *cert_lens, size_t num_certs);
+
+// X509_LAZY_CERT_SET_can_index returns one if `der` is shaped enough like a
+// Certificate for `X509_LAZY_CERT_SET_new` to index it (which otherwise fails
+// the whole set), and zero otherwise. It does not check that the certificate
+// fully parses.
+OPENSSL_EXPORT int X509_LAZY_CERT_SET_can_index(const uint8_t *der, size_t len);
+
+// X509_LAZY_CERT_SET_get0_der returns the DER of the `idx`th certificate in
+// `set` without parsing it, or NULL if `idx` is out of range.
+OPENSSL_EXPORT const CRYPTO_BUFFER *X509_LAZY_CERT_SET_get0_der(
+    const X509_LAZY_CERT_SET *set, size_t idx);
+
+// X509_LAZY_CERT_SET_get0_subject points `*out` and `*out_len` at the
+// DER-encoded subject Name of the `idx`th certificate in `set` (within the
+// certificate's own DER) without parsing it, e.g. for
+// `SSL_CTX_set0_client_CAs`. It returns one, or zero if `idx` is out of range.
+OPENSSL_EXPORT int X509_LAZY_CERT_SET_get0_subject(const X509_LAZY_CERT_SET *set,
+                                                   size_t idx,
+                                                   const uint8_t **out,
+                                                   size_t *out_len);
+
+// X509_LAZY_CERT_SET_up_ref adds one to the reference count of `set` and
+// returns one.
+OPENSSL_EXPORT int X509_LAZY_CERT_SET_up_ref(X509_LAZY_CERT_SET *set);
+
+// X509_LAZY_CERT_SET_free releases a reference to `set`.
+OPENSSL_EXPORT void X509_LAZY_CERT_SET_free(X509_LAZY_CERT_SET *set);
+
+// X509_LAZY_CERT_SET_num returns the number of certificates in `set`.
+OPENSSL_EXPORT size_t X509_LAZY_CERT_SET_num(const X509_LAZY_CERT_SET *set);
+
+// X509_LAZY_CERT_SET_get0 returns the `idx`th certificate in `set`, parsing it
+// on first use, or NULL on error. The result is owned by `set`. This function
+// is thread-safe.
+OPENSSL_EXPORT X509 *X509_LAZY_CERT_SET_get0(X509_LAZY_CERT_SET *set,
+                                             size_t idx);
+
+// X509_STORE_add_lazy_cert_set configures `store` to trust every certificate
+// in `set`, exactly as if each had been passed to `X509_STORE_add_cert`, except
+// that a certificate is only parsed and added to `store`'s object cache the
+// first time a lookup names its subject. It returns one on success and zero on
+// error. `store` takes a reference to `set`. This function has the same
+// thread-safety as `X509_STORE_add_cert`.
+//
+// `X509_STORE_get0_objects` and `X509_STORE_get1_objects` only report
+// certificates from `set` that have already been looked up.
+OPENSSL_EXPORT int X509_STORE_add_lazy_cert_set(X509_STORE *store,
+                                                X509_LAZY_CERT_SET *set);
+
 // X509_STORE_add_crl adds `crl` to `store`. It returns one on success and zero
 // on error. This function internally increments `crl`'s reference count, so the
 // caller retains ownership of `crl`. CRLs added in this way are candidates for
@@ -2847,13 +2911,12 @@ OPENSSL_EXPORT int X509_STORE_add_crl(X509_STORE *store, X509_CRL *crl);
 // explicitly unset after creating the `X509_STORE_CTX`.
 //
 // As of writing these late defaults are a depth limit (see
-// `X509_VERIFY_PARAM_set_depth`) and the `X509_V_FLAG_TRUSTED_FIRST` flag. This
-// warning does not apply if the parameters were set in `store`.
+// `X509_VERIFY_PARAM_set_depth`). This warning does not apply if the parameters
+// were set in `store`.
 //
 // TODO(crbug.com/boringssl/441): This behavior is very surprising. Can we
 // remove this notion of late defaults? The unsettable value at `X509_STORE` is
 // -1, which rejects everything but explicitly-trusted self-signed certificates.
-// `X509_V_FLAG_TRUSTED_FIRST` is mostly a workaround for poor path-building.
 OPENSSL_EXPORT X509_VERIFY_PARAM *X509_STORE_get0_param(X509_STORE *store);
 
 // X509_STORE_set1_param copies verification parameters from `param` as in
@@ -3276,19 +3339,34 @@ OPENSSL_EXPORT int X509_VERIFY_PARAM_set1(X509_VERIFY_PARAM *to,
 // X509_V_FLAG_CHECK_SS_SIGNATURE checks the redundant signature on self-signed
 // trust anchors. This check provides no security benefit and only wastes CPU.
 #define X509_V_FLAG_CHECK_SS_SIGNATURE 0x4000
-// X509_V_FLAG_TRUSTED_FIRST, during path-building, checks for a match in the
-// trust store before considering an untrusted intermediate. This flag is
-// enabled by default.
-#define X509_V_FLAG_TRUSTED_FIRST 0x8000
+// X509_V_FLAG_TRUSTED_FIRST does nothing. The behavior it controls is always
+// enabled.
+#define X509_V_FLAG_TRUSTED_FIRST 0x0
 // X509_V_FLAG_PARTIAL_CHAIN treats all trusted certificates as trust anchors,
 // independent of the `X509_VERIFY_PARAM_set_trust` setting.
 #define X509_V_FLAG_PARTIAL_CHAIN 0x80000
-// X509_V_FLAG_NO_ALT_CHAINS disables building alternative chains if the initial
-// one was rejected.
-#define X509_V_FLAG_NO_ALT_CHAINS 0x100000
+// X509_V_FLAG_NO_ALT_CHAINS does nothing.
+#define X509_V_FLAG_NO_ALT_CHAINS 0x0
 // X509_V_FLAG_NO_CHECK_TIME disables all time checks in certificate
 // verification.
 #define X509_V_FLAG_NO_CHECK_TIME 0x200000
+// X509_V_FLAG_ALLOW_TIMEZONE_OFFSET allows `notBefore` and `notAfter` fields
+// to contain a time zone offset.
+#define X509_V_FLAG_ALLOW_TIMEZONE_OFFSET 0x1000000
+// X509_V_FLAG_USE_MTC_DRAFT_PLANTS_05 enables the verification of Merkle Tree
+// Certificates as specified in draft-ietf-plants-merkle-tree-certs-05.
+#define X509_V_FLAG_USE_MTC_DRAFT_PLANTS_05 0x400000
+// X509_V_FLAG_IGNORE_EXPIRED_TRUST_ANCHORS makes chain building treat a
+// certificate from the trust store (or `X509_STORE_CTX_set0_trusted_stack`)
+// whose validity period does not cover the verification time as if it were
+// not there, so it can neither anchor a chain nor shadow a currently-valid
+// certificate for the same issuer supplied by the peer or elsewhere in the
+// store. A chain that reaches no usable anchor after such a certificate was
+// passed over still reports `X509_V_ERR_CERT_HAS_EXPIRED` (or
+// `X509_V_ERR_CERT_NOT_YET_VALID`) rather than an unknown-issuer error.
+// Untrusted (peer) certificates are unaffected. Has no effect with
+// `X509_V_FLAG_NO_CHECK_TIME`.
+#define X509_V_FLAG_IGNORE_EXPIRED_TRUST_ANCHORS 0x2000000
 
 // X509_VERIFY_PARAM_set_flags enables all values in `flags` in `param`'s
 // verification flags and returns one. `flags` should be a combination of
@@ -4352,9 +4430,23 @@ OPENSSL_EXPORT int X509_cmp_time(const ASN1_TIME *s, const time_t *t);
 // negative number if `s` <= `t` and a positive number if `s` > `t`. On error,
 // it returns zero.
 //
+// If `s` has a time zone offset, it returns an error (0).
+//
 // WARNING: Unlike most comparison functions, this function returns zero on
 // error, not equality.
 OPENSSL_EXPORT int X509_cmp_time_posix(const ASN1_TIME *s, int64_t t);
+
+// X509_cmp_time_posix_nonstandard compares `s` against `t`. On success, it
+// returns a negative number if `s` <= `t` and a positive number if `s` > `t`.
+// On error, it returns zero.
+//
+// If `s` has a time zone offset, it applies it before comparing to `t`. See
+// `ASN1_TIME_to_posix_nonstandard` for more details.
+//
+// WARNING: Unlike most comparison functions, this function returns zero on
+// error, not equality.
+OPENSSL_EXPORT int X509_cmp_time_posix_nonstandard(const ASN1_TIME *s,
+                                                   int64_t t);
 
 // X509_cmp_current_time behaves like `X509_cmp_time` but compares `s` against
 // the current time.
@@ -5326,6 +5418,8 @@ BORINGSSL_MAKE_DELETER(X509_PUBKEY, X509_PUBKEY_free)
 BORINGSSL_MAKE_DELETER(X509_REQ, X509_REQ_free)
 BORINGSSL_MAKE_DELETER(X509_REVOKED, X509_REVOKED_free)
 BORINGSSL_MAKE_DELETER(X509_SIG, X509_SIG_free)
+BORINGSSL_MAKE_DELETER(X509_LAZY_CERT_SET, X509_LAZY_CERT_SET_free)
+BORINGSSL_MAKE_UP_REF(X509_LAZY_CERT_SET, X509_LAZY_CERT_SET_up_ref)
 BORINGSSL_MAKE_DELETER(X509_STORE, X509_STORE_free)
 BORINGSSL_MAKE_UP_REF(X509_STORE, X509_STORE_up_ref)
 BORINGSSL_MAKE_DELETER(X509_STORE_CTX, X509_STORE_CTX_free)
@@ -5381,5 +5475,7 @@ BSSL_NAMESPACE_END
 #define X509_R_NO_CERTIFICATE_OR_CRL_FOUND 142
 #define X509_R_NO_CRL_FOUND 143
 #define X509_R_INVALID_POLICY_EXTENSION 144
+#define X509_R_INVALID_MTC_CA 145
+#define X509_R_INVALID_MTC_PROOF 146
 
 #endif  // OPENSSL_HEADER_X509_H

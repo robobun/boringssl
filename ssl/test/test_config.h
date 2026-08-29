@@ -46,12 +46,13 @@ struct CredentialConfig {
   std::vector<uint8_t> pake_client_id;
   std::vector<uint8_t> pake_server_id;
   std::vector<uint8_t> pake_password;
-  std::vector<uint8_t> trust_anchor_id;
+  std::vector<uint8_t> cert_properties;
   bool wrong_pake_role = false;
   std::vector<uint8_t> psk;
   std::vector<uint8_t> psk_identity;
   std::vector<uint8_t> psk_context;
   const EVP_MD *psk_hash;
+  std::vector<uint8_t> session_id_context;
 };
 
 struct TestConfig {
@@ -79,6 +80,7 @@ struct TestConfig {
   std::string trust_cert;
   std::string expect_server_name;
   bool enable_ech_grease = false;
+  bool reject_unusable_ech_config = false;
   std::vector<std::vector<uint8_t>> ech_server_configs;
   std::vector<std::vector<uint8_t>> ech_server_keys;
   std::vector<int> ech_is_retry_config;
@@ -216,7 +218,6 @@ struct TestConfig {
   bool use_custom_verify_callback = false;
   std::string expect_msg_callback;
   bool allow_false_start_without_alpn = false;
-  bool handoff = false;
   bool handshake_hints = false;
   bool allow_hint_mismatch = false;
   bool use_ocsp_callback = false;
@@ -262,6 +263,7 @@ struct TestConfig {
   std::optional<uint16_t> request_server_padding;
   bool expect_server_sent_requested_padding = false;
   bool server_supports_padding = false;
+  std::vector<uint8_t> session_id_context;
 
   std::vector<const char *> handshaker_args;
 

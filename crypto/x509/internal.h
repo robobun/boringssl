@@ -27,19 +27,37 @@
 // Internal structures.
 
 DECLARE_OPAQUE_STRUCT(x509_st, X509Impl)
+DECLARE_OPAQUE_STRUCT(x509_lazy_cert_set_st, X509LazyCertSet)
 DECLARE_OPAQUE_STRUCT(x509_store_st, X509Store)
 DECLARE_OPAQUE_STRUCT(X509_name_st, X509Name)
-
-struct X509_pubkey_st {
-  X509_ALGOR algor;
-  ASN1_BIT_STRING public_key;
-  EVP_PKEY *pkey;
-} /* X509_PUBKEY */;
+DECLARE_OPAQUE_STRUCT(X509_name_entry_st, X509NameEntry)
+DECLARE_OPAQUE_STRUCT(X509_pubkey_st, X509Pubkey)
 
 BSSL_NAMESPACE_BEGIN
 
-void x509_pubkey_init(X509_PUBKEY *key);
-void x509_pubkey_cleanup(X509_PUBKEY *key);
+void x509_algor_init(X509_ALGOR *alg);
+void x509_algor_cleanup(X509_ALGOR *alg);
+
+// A ScopedX509Algor is a stack-allocatable `X509_ALGOR` with managed lifetime.
+// This cannot use `DECLARE_OPAQUE_STRUCT` because `X509_ALGOR` is a public
+// struct.
+BORINGSSL_MAKE_STACK_TRAITS(X509_ALGOR, x509_algor_init, x509_algor_cleanup)
+using ScopedX509Algor = internal::StackAllocated<X509_ALGOR>;
+
+// x509_parse_algorithm parses a DER-encoded, AlgorithmIdentifier from `cbs` and
+// writes the result to `*out`. It returns one on success and zero on error.
+int x509_parse_algorithm(CBS *cbs, X509_ALGOR *out);
+
+// x509_marshal_algorithm marshals `in` as a DER-encoded, AlgorithmIdentifier
+// and writes the result to `out`. It returns one on success and zero on error.
+int x509_marshal_algorithm(CBB *out, const X509_ALGOR *in);
+
+class X509Pubkey : public X509_pubkey_st {
+ public:
+  ScopedX509Algor algor;
+  ScopedASN1String public_key{V_ASN1_BIT_STRING};
+  UniquePtr<EVP_PKEY> pkey;
+};
 
 int x509_parse_public_key(CBS *cbs, X509_PUBKEY *out,
                           Span<const EVP_PKEY_ALG *const> algs);
@@ -52,21 +70,32 @@ int x509_pubkey_set1(X509_PUBKEY *key, EVP_PKEY *pkey);
 // depend on the tables.
 DECLARE_ASN1_ITEM(X509_PUBKEY)
 
-BSSL_NAMESPACE_END
+class X509NameEntry : public X509_name_entry_st {
+ public:
+  static constexpr bool kAllowUniquePtr = true;
+  X509NameEntry();
 
-struct X509_name_entry_st {
-  ASN1_OBJECT *object;
-  ASN1_STRING value;
-  int set;
-} /* X509_NAME_ENTRY */;
-
-BSSL_NAMESPACE_BEGIN
+  UniquePtr<ASN1_OBJECT> object;
+  ScopedASN1String value{-1};
+  int set = 0;
+};
 
 // X509_NAME_ENTRY is an `ASN1_ITEM` whose ASN.1 type is AttributeTypeAndValue
 // (RFC 5280) and C type is `X509_NAME_ENTRY*`.
 DECLARE_ASN1_ITEM(X509_NAME_ENTRY)
 
-struct X509_NAME_CACHE {
+// x509_verify_trusted_cert_in_time returns zero if `ctx` has
+// `X509_V_FLAG_IGNORE_EXPIRED_TRUST_ANCHORS` set and `x509`'s validity period
+// does not cover `ctx`'s verification time, and one otherwise.
+int x509_verify_trusted_cert_in_time(X509_STORE_CTX *ctx,
+                                     const X509 *x509);
+
+// x509_name_canon_from_der parses a DER-encoded Name from `cbs` and sets `out`
+// to its canonical form, as `X509_NAME_cmp` would compare it, without
+// constructing an `X509_NAME`. It returns one on success and zero on error.
+int x509_name_canon_from_der(CBS *cbs, Array<uint8_t> *out);
+
+struct X509NameCache {
   static constexpr bool kAllowUniquePtr = true;
   // canon contains the DER-encoded canonicalized X.509 Name, not including the
   // outermost TLV.
@@ -77,8 +106,14 @@ struct X509_NAME_CACHE {
 
 class X509Name : public X509_name_st {
  public:
-  STACK_OF(X509_NAME_ENTRY) *entries = nullptr;
-  mutable bssl::Atomic<bssl::X509_NAME_CACHE *> cache;
+  ~X509Name();
+
+  // TODO(crbug.com/42290036): Switch to `Vector<UniquePtr<X509NameEntry>>`,
+  // which would save an allocation. Potentially `Vector<X509NameEntry>` if we
+  // are willing to break pointer stability of entries after
+  // `X509_NAME_add_entry` or `X509_NAME_delete_entry`.
+  UniquePtr<STACK_OF(X509_NAME_ENTRY)> entries;
+  mutable Atomic<X509NameCache *> cache = nullptr;
 } /* X509_NAME */;
 
 BSSL_NAMESPACE_END
@@ -127,35 +162,35 @@ class X509Impl : public x509_st, public RefCounted<X509Impl> {
 
   // TBSCertificate fields:
   uint8_t version = X509_VERSION_1;  // One of the `X509_VERSION_*` constants.
-  ASN1_INTEGER serialNumber;
-  X509_ALGOR tbs_sig_alg;
+  ScopedASN1String serialNumber{V_ASN1_INTEGER};
+  ScopedX509Algor tbs_sig_alg;
   X509Name issuer;
-  ASN1_TIME notBefore;
-  ASN1_TIME notAfter;
+  ScopedASN1String notBefore{-1};
+  ScopedASN1String notAfter{-1};
   X509Name subject;
-  X509_PUBKEY key;
-  ASN1_BIT_STRING *issuerUID = nullptr;            // [ 1 ] optional in v2
-  ASN1_BIT_STRING *subjectUID = nullptr;           // [ 2 ] optional in v2
+  X509Pubkey key;
+  UniquePtr<ASN1_BIT_STRING> issuerUID;            // [ 1 ] optional in v2
+  UniquePtr<ASN1_BIT_STRING> subjectUID;           // [ 2 ] optional in v2
   STACK_OF(X509_EXTENSION) *extensions = nullptr;  // [ 3 ] optional in v3
   // Certificate fields:
-  X509_ALGOR sig_alg;
-  ASN1_BIT_STRING signature;
+  ScopedX509Algor sig_alg;
+  ScopedASN1String signature{V_ASN1_BIT_STRING};
   // Other state:
   // buf, if not nullptr, contains a copy of the serialized Certificate.
   // TODO(davidben): Now every parsed `X509` has an underlying `CRYPTO_BUFFER`,
   // but `X509`s created peacemeal do not. Can we make this more uniform?
-  CRYPTO_BUFFER *buf = nullptr;
+  UniquePtr<CRYPTO_BUFFER> buf;
   CRYPTO_EX_DATA ex_data;
   // These contain copies of various extension values
   long ex_pathlen = -1;
   uint32_t ex_flags = 0;
   uint32_t ex_kusage = 0;
   uint32_t ex_xkusage = 0;
-  ASN1_OCTET_STRING *skid = nullptr;
-  AUTHORITY_KEYID *akid = nullptr;
-  STACK_OF(DIST_POINT) *crldp = nullptr;
-  STACK_OF(GENERAL_NAME) *altname = nullptr;
-  NAME_CONSTRAINTS *nc = nullptr;
+  UniquePtr<ASN1_OCTET_STRING> skid;
+  UniquePtr<AUTHORITY_KEYID> akid;
+  UniquePtr<STACK_OF(DIST_POINT)> crldp;
+  UniquePtr<STACK_OF(GENERAL_NAME)> altname;
+  UniquePtr<NAME_CONSTRAINTS> nc;
   unsigned char cert_hash[SHA256_DIGEST_LENGTH] = {};
   bssl::X509_CERT_AUX *aux = nullptr;
   Mutex lock;
@@ -165,7 +200,19 @@ class X509Impl : public x509_st, public RefCounted<X509Impl> {
   ~X509Impl();
 } /* X509 */;
 
+// x509_marshal_tbs_cert sets `cbb` to the serialized TBSCertificate of `x509`.
+// It either replays the saved TBSCertificate encoding from the `CRYPTO_BUFFER`,
+// or marshals the TBSCertificate from fields set on `x509`. It returns one on
+// success or zero on error.
 int x509_marshal_tbs_cert(CBB *cbb, const X509 *x509);
+
+// x509_get_or_marshal_tbs_cert sets `out` to the serialized TBSCertificate of
+// `x509`. If possible, it gets the saved TBSCertificate encoding from the
+// `CRYPTO_BUFFER` of `x509`, otherwise it marshals the TBSCertificate from
+// fields set on `x509` into `scratch`. It returns one on success or zero on
+// error.
+int x509_get_or_marshal_tbs_cert(CBS *out, Array<uint8_t> *scratch,
+                                 const X509 *x509);
 
 // X509 is an `ASN1_ITEM` whose ASN.1 type is X.509 Certificate (RFC 5280) and C
 // type is `X509*`.
@@ -327,6 +374,49 @@ struct x509_lookup_method_st {
 
 BSSL_NAMESPACE_BEGIN
 
+struct X509LazyCert {
+  UniquePtr<CRYPTO_BUFFER> der;
+  // subject is the Name TLV within `der`.
+  Span<const uint8_t> subject;
+  // canon is the subject in the form `X509_NAME_cmp` compares.
+  Array<uint8_t> canon;
+  Atomic<X509 *> x509 = nullptr;
+};
+
+class X509LazyCertSet : public x509_lazy_cert_set_st,
+                        public RefCounted<X509LazyCertSet> {
+ public:
+  X509LazyCertSet();
+
+  // Init takes a reference to each of `certs` and indexes them by subject
+  // without parsing them. It returns false if any is not a well-formed
+  // Certificate.
+  bool Init(CRYPTO_BUFFER *const *certs, size_t num);
+
+  size_t size() const { return certs_.size(); }
+
+  // Get returns the `idx`th certificate, parsing it on first call.
+  X509 *Get(size_t idx);
+  const CRYPTO_BUFFER *GetDER(size_t idx) const {
+    return idx < certs_.size() ? certs_[idx].der.get() : nullptr;
+  }
+  Span<const uint8_t> GetSubject(size_t idx) const {
+    return idx < certs_.size() ? certs_[idx].subject : Span<const uint8_t>();
+  }
+
+  // AddMatchesToStore parses every certificate whose subject is `name` and adds
+  // it to `store`. It returns false on error; no match is not an error.
+  bool AddMatchesToStore(X509Store *store, const X509_NAME *name);
+
+ private:
+  friend RefCounted;
+  ~X509LazyCertSet();
+
+  Array<X509LazyCert> certs_;
+  // by_subject_ holds indices into `certs_` sorted by `canon`.
+  Array<size_t> by_subject_;
+};
+
 // This is used to hold everything.  It is used for all certificate
 // validation.  Once we have a certificate chain, the 'verify'
 // function is then called to actually check the cert chain.
@@ -334,9 +424,16 @@ class X509Store : public x509_store_st, public RefCounted<X509Store> {
  public:
   X509Store();
 
+  // MaterializeLazy adds any not-yet-parsed lazily trusted certificates with
+  // subject `name` to `objs`. It must be called without `objs_lock` held.
+  void MaterializeLazy(int type, const X509_NAME *name);
+
   // The following is a cache of trusted certs
   UniquePtr<STACK_OF(X509_OBJECT)> objs;  // Cache of all objects
   Mutex objs_lock;
+
+  // lazy_cert_sets is guarded by `objs_lock`.
+  Vector<UniquePtr<X509LazyCertSet>> lazy_cert_sets;
 
   // These are external lookup methods
   Vector<UniquePtr<X509_LOOKUP>> get_cert_methods;
@@ -389,6 +486,10 @@ struct x509_store_ctx_st {
   int error_depth;
   int error;
   X509 *current_cert;
+  // With X509_V_FLAG_IGNORE_EXPIRED_TRUST_ANCHORS: the time error of the last
+  // trust anchor a lookup skipped, so a chain that then fails as untrusted can
+  // be reported as that instead. Zero if none was skipped.
+  int ignored_anchor_error;
   X509_CRL *current_crl;  // current CRL
 
   X509 *current_crl_issuer;  // issuer of current CRL
@@ -444,6 +545,13 @@ int x509_digest_verify_init(EVP_MD_CTX *ctx, const X509_ALGOR *sigalg,
 int x509_verify_signature(const X509_ALGOR *sigalg,
                           const ASN1_BIT_STRING *signature,
                           Span<const uint8_t> in, EVP_PKEY *pkey);
+
+// x509_verify_signature_bytes behaves like `x509_verify_signature` but takes in
+// a span containing the signature bytes (without ASN.1 headers). It returns one
+// if the signature is valid and zero on error.
+int x509_verify_signature_bytes(const X509_ALGOR *sigalg,
+                                Span<const uint8_t> signature,
+                                Span<const uint8_t> in, EVP_PKEY *pkey);
 
 // x509_sign_to_bit_string signs `in` using `ctx` and saves the result in `out`.
 // It returns the length of the signature on success and zero on error.
@@ -611,9 +719,6 @@ int X509_PURPOSE_get_trust(const X509_PURPOSE *xp);
 // TODO(https://crbug.com/boringssl/695): Remove this.
 int DIST_POINT_set_dpname(DIST_POINT_NAME *dpn, X509_NAME *iname);
 
-void x509_name_init(X509_NAME *name);
-void x509_name_cleanup(X509_NAME *name);
-
 // x509_parse_name parses a DER-encoded, X.509 Name from `cbs` and writes the
 // result to `*out`. It returns one on success and zero on error.
 int x509_parse_name(CBS *cbs, X509_NAME *out);
@@ -622,21 +727,40 @@ int x509_parse_name(CBS *cbs, X509_NAME *out);
 // result to `out`. It returns one on success and zero on error.
 int x509_marshal_name(CBB *out, const X509_NAME *in);
 
-const X509_NAME_CACHE *x509_name_get_cache(const X509_NAME *name);
+const X509NameCache *x509_name_get_cache(const X509_NAME *name);
 void x509_name_invalidate_cache(X509_NAME *name);
 
 int x509_name_copy(X509_NAME *dst, const X509_NAME *src);
 
-void x509_algor_init(X509_ALGOR *alg);
-void x509_algor_cleanup(X509_ALGOR *alg);
 
-// x509_parse_algorithm parses a DER-encoded, AlgorithmIdentifier from `cbs` and
-// writes the result to `*out`. It returns one on success and zero on error.
-int x509_parse_algorithm(CBS *cbs, X509_ALGOR *out);
+// Merkle Tree Certificate (MTC) verification functions.
 
-// x509_marshal_algorithm marshals `in` as a DER-encoded, AlgorithmIdentifier
-// and writes the result to `out`. It returns one on success and zero on error.
-int x509_marshal_algorithm(CBB *out, const X509_ALGOR *in);
+// x509_is_merkle_tree_ca returns whether `x509` contains an extension of type
+// id-pe-mtcCertificationAuthority.
+bool x509_is_merkle_tree_ca(const X509 *x509);
+
+// x509_evaluate_mtc_subtree_inclusion_proof carries out the procedure in
+// section 4.3.2 of draft-ietf-plants-merkle-tree-certs to evaluate a subtree
+// inclusion proof for an entry at index `index` with hash `entry_hash` of a
+// subtree defined by [`subtree_start`, `subtree_end`). The `inclusion_proof` to
+// be evaluated is passed as a byte array consisting of concatenated hashes
+// produced from the `log_hash` algorithm. This function returns true if
+// inclusion proof evaluation succeeded, and if so, writes the expected subtree
+// hash for the specified subtree containing the entry to `out`, which must be
+// the right size for `log_hash`. It returns false on error, including if the
+// inclusion proof fails to evaluate.
+bool x509_evaluate_mtc_subtree_inclusion_proof(
+    Span<uint8_t> out, const EVP_MD *log_hash,
+    Span<const uint8_t> inclusion_proof, uint64_t index,
+    Span<const uint8_t> entry_hash, uint64_t subtree_start,
+    uint64_t subtree_end);
+
+// x509_verify_mtc verifies `x509` as a Merkle Tree Certificate issued by
+// `issuer`, which must be an MTC CA represented in X.509 format. `pkey` is the
+// `issuer`'s public key. It returns one if the MTC is valid, or zero on error.
+// This function only checks the MTC proof itself and does not perform a full
+// certificate validation.
+int x509_verify_mtc(const X509 *x509, const EVP_PKEY *pkey, const X509 *issuer);
 
 
 // Standard extensions.

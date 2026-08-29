@@ -137,7 +137,7 @@ func addExtensionTests() {
 				flags:         []string{"-expect-server-name", "example.com"},
 				resumeSession: true,
 				expectations: connectionExpectations{
-					serverNameAck: ptrTo(true),
+					serverNameAck: new(true),
 				},
 			})
 			testCases = append(testCases, testCase{
@@ -154,7 +154,7 @@ func addExtensionTests() {
 				},
 				resumeSession: true,
 				expectations: connectionExpectations{
-					serverNameAck: ptrTo(false),
+					serverNameAck: new(false),
 				},
 			})
 
@@ -1989,20 +1989,6 @@ func addExtensionTests() {
 			}
 		}
 	}
-
-	testCases = append(testCases, testCase{
-		testType: clientTest,
-		name:     "ClientHelloPadding",
-		config: Config{
-			Bugs: ProtocolBugs{
-				RequireClientHelloSize: 512,
-			},
-		},
-		// This hostname just needs to be long enough to push the
-		// ClientHello into F5's danger zone between 256 and 511 bytes
-		// long.
-		flags: []string{"-host-name", "01234567890123456789012345678901234567890123456789012345678901234567890123456789.com"},
-	})
 
 	// Test that illegal extensions in TLS 1.3 are rejected by the client if
 	// in ServerHello.

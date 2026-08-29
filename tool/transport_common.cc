@@ -95,7 +95,6 @@ static void SplitHostPort(std::string *out_hostname, std::string *out_port,
                           const std::string &hostname_and_port) {
   size_t colon_offset = hostname_and_port.find_last_of(':');
   const size_t bracket_offset = hostname_and_port.find_last_of(']');
-  std::string hostname, port;
 
   // An IPv6 literal may have colons internally, guarded by square brackets.
   if (bracket_offset != std::string::npos &&
@@ -121,7 +120,8 @@ static std::string GetLastSocketErrorString() {
       reinterpret_cast<char *>(&buffer), 0, nullptr);
   if (len == 0) {
     char buf[256];
-    snprintf(buf, sizeof(buf), "unknown error (0x%x)", error);
+    snprintf(buf, sizeof(buf), "unknown error (0x%x)",
+             static_cast<unsigned>(error));
     return buf;
   }
   std::string ret(buffer, len);
