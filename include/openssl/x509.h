@@ -2855,7 +2855,8 @@ OPENSSL_EXPORT X509 *X509_LAZY_CERT_SET_get0(X509_LAZY_CERT_SET *set,
 // in `set`, exactly as if each had been passed to `X509_STORE_add_cert`, except
 // that a certificate is only parsed and added to `store`'s object cache the
 // first time a lookup names its subject. It returns one on success and zero on
-// error. `store` takes a reference to `set`.
+// error. `store` takes a reference to `set`. This function has the same
+// thread-safety as `X509_STORE_add_cert`.
 //
 // `X509_STORE_get0_objects` and `X509_STORE_get1_objects` only report
 // certificates from `set` that have already been looked up.

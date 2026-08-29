@@ -619,7 +619,29 @@ void X509Store::MaterializeLazy(int type, const X509_NAME *name) {
   if (type != X509_LU_X509) {
     return;
   }
-  for (const auto &set : lazy_cert_sets) {
+  // Snapshot the sets so `X509_STORE_add_lazy_cert_set` may run concurrently
+  // with lookups, as `X509_STORE_add_cert` may. `AddMatchesToStore` takes
+  // `objs_lock` for writing, so it cannot run under the read lock.
+  static constexpr size_t kInline = 4;
+  UniquePtr<X509LazyCertSet> inline_sets[kInline];
+  Vector<UniquePtr<X509LazyCertSet>> more_sets;
+  size_t num;
+  {
+    MutexReadLock lock(&objs_lock);
+    num = lazy_cert_sets.size();
+    for (size_t i = 0; i < num; i++) {
+      UniquePtr<X509LazyCertSet> ref = UpRef(lazy_cert_sets[i].get());
+      if (i < kInline) {
+        inline_sets[i] = std::move(ref);
+      } else if (!more_sets.Push(std::move(ref))) {
+        num = i;
+        break;
+      }
+    }
+  }
+  for (size_t i = 0; i < num; i++) {
+    X509LazyCertSet *set =
+        i < kInline ? inline_sets[i].get() : more_sets[i - kInline].get();
     if (!set->AddMatchesToStore(this, name)) {
       // An anchor that fails to parse is treated as absent, as a lookup method
       // that fails is.

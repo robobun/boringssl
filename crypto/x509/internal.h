@@ -418,6 +418,7 @@ class X509Store : public x509_store_st, public RefCounted<X509Store> {
   UniquePtr<STACK_OF(X509_OBJECT)> objs;  // Cache of all objects
   Mutex objs_lock;
 
+  // lazy_cert_sets is guarded by `objs_lock`.
   Vector<UniquePtr<X509LazyCertSet>> lazy_cert_sets;
 
   // These are external lookup methods

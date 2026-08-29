@@ -11956,6 +11956,61 @@ TEST(X509Test, LazyCertSet) {
   ERR_clear_error();
 }
 
+#if defined(OPENSSL_THREADS)
+// Many threads verifying against one store race to materialize the same lazy
+// anchor, and another thread adds a second set mid-flight.
+TEST(X509Test, LazyCertSetThreads) {
+  UniquePtr<X509> root(CertFromPEM(kRootCAPEM));
+  UniquePtr<X509> cross_signing_root(CertFromPEM(kCrossSigningRootPEM));
+  UniquePtr<X509> intermediate(CertFromPEM(kIntermediatePEM));
+  UniquePtr<X509> leaf(CertFromPEM(kLeafPEM));
+  ASSERT_TRUE(root && cross_signing_root && intermediate && leaf);
+
+  static std::vector<uint8_t> root_der, cross_der;
+  root_der = CertToDER(root.get());
+  cross_der = CertToDER(cross_signing_root.get());
+  const uint8_t *root_ptr = root_der.data(), *cross_ptr = cross_der.data();
+  size_t root_len = root_der.size(), cross_len = cross_der.size();
+  UniquePtr<X509_LAZY_CERT_SET> set(
+      X509_LAZY_CERT_SET_new_static(&root_ptr, &root_len, 1));
+  UniquePtr<X509_LAZY_CERT_SET> set2(
+      X509_LAZY_CERT_SET_new_static(&cross_ptr, &cross_len, 1));
+  ASSERT_TRUE(set && set2);
+
+  UniquePtr<X509_STORE> store(X509_STORE_new());
+  ASSERT_TRUE(store);
+  ASSERT_TRUE(X509_STORE_add_lazy_cert_set(store.get(), set.get()));
+
+  const size_t kNumThreads = 16;
+  std::vector<std::thread> threads;
+  for (size_t i = 0; i < kNumThreads; i++) {
+    threads.emplace_back([&] {
+      for (int j = 0; j < 20; j++) {
+        EXPECT_EQ(X509_V_OK, VerifyWithStore(leaf.get(), store.get(),
+                                             {intermediate.get()}));
+      }
+    });
+  }
+  threads.emplace_back([&] {
+    EXPECT_TRUE(X509_STORE_add_lazy_cert_set(store.get(), set2.get()));
+    EXPECT_TRUE(X509_STORE_add_cert(store.get(), intermediate.get()));
+  });
+  for (auto &t : threads) {
+    t.join();
+  }
+  // The root was materialized exactly once.
+  UniquePtr<STACK_OF(X509_OBJECT)> objs(X509_STORE_get1_objects(store.get()));
+  ASSERT_TRUE(objs);
+  size_t roots = 0;
+  for (const X509_OBJECT *obj : objs.get()) {
+    if (X509_cmp(X509_OBJECT_get0_X509(obj), root.get()) == 0) {
+      roots++;
+    }
+  }
+  EXPECT_EQ(1u, roots);
+}
+#endif
+
 // Populating a store must not re-sort on every insertion, but duplicates must
 // still be rejected and lookups must still find every match.
 TEST(X509Test, StoreAddManyThenLookup) {
