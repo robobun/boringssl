@@ -87,7 +87,7 @@ DECLARE_ASN1_ITEM(X509_NAME_ENTRY)
 // x509_verify_trusted_cert_in_time returns zero if `ctx` has
 // `X509_V_FLAG_IGNORE_EXPIRED_TRUST_ANCHORS` set and `x509`'s validity period
 // does not cover `ctx`'s verification time, and one otherwise.
-int x509_verify_trusted_cert_in_time(const X509_STORE_CTX *ctx,
+int x509_verify_trusted_cert_in_time(X509_STORE_CTX *ctx,
                                      const X509 *x509);
 
 // x509_name_canon_from_der parses a DER-encoded Name from `cbs` and sets `out`
@@ -486,6 +486,10 @@ struct x509_store_ctx_st {
   int error_depth;
   int error;
   X509 *current_cert;
+  // With X509_V_FLAG_IGNORE_EXPIRED_TRUST_ANCHORS: the time error of the last
+  // trust anchor a lookup skipped, so a chain that then fails as untrusted can
+  // be reported as that instead. Zero if none was skipped.
+  int ignored_anchor_error;
   X509_CRL *current_crl;  // current CRL
 
   X509 *current_crl_issuer;  // issuer of current CRL

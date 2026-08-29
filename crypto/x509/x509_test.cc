@@ -12074,10 +12074,10 @@ TEST(X509Test, IgnoreExpiredTrustAnchors) {
       // Both trusted, either order: the valid one is found.
       {{root.get(), int_old.get(), int_new.get()}, {}, X509_V_ERR_CERT_HAS_EXPIRED, X509_V_OK},
       {{root.get(), int_new.get(), int_old.get()}, {}, X509_V_OK, X509_V_OK},
-      // Only the expired intermediate trusted, nothing valid anywhere: absent, so untrusted.
-      {{root.get(), int_old.get()}, {}, X509_V_ERR_CERT_HAS_EXPIRED, X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY},
-      // Expired root: absent, so the chain is incomplete rather than expired.
-      {{root_old.get()}, {int_new.get()}, X509_V_ERR_CERT_HAS_EXPIRED, X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY},
+      // Only the expired intermediate trusted, nothing valid anywhere: absent, and the failure still says why.
+      {{root.get(), int_old.get()}, {}, X509_V_ERR_CERT_HAS_EXPIRED, X509_V_ERR_CERT_HAS_EXPIRED},
+      // Expired root: likewise.
+      {{root_old.get()}, {int_new.get()}, X509_V_ERR_CERT_HAS_EXPIRED, X509_V_ERR_CERT_HAS_EXPIRED},
       // Expired and valid root both trusted: valid one anchors.
       {{root_old.get(), root.get()}, {int_new.get()}, X509_V_ERR_CERT_HAS_EXPIRED, X509_V_OK},
   };
@@ -12095,6 +12095,19 @@ TEST(X509Test, IgnoreExpiredTrustAnchors) {
     EXPECT_EQ(t.without_flag, VerifyWithStore(leaf.get(), store.get(), t.untrusted));
     ASSERT_TRUE(X509_STORE_set_flags(store.get(), kFlag));
     EXPECT_EQ(t.with_flag, VerifyWithStore(leaf.get(), store.get(), t.untrusted));
+  }
+  // A not-yet-valid anchor reports that; the error depth/cert are the end of the chain that was built.
+  {
+    UniquePtr<X509> root_future = MakeTestCert("Root", "Root", root_key.get(), /*is_ca=*/true);
+    ASSERT_TRUE(root_future);
+    ASSERT_TRUE(ASN1_TIME_adj(X509_getm_notBefore(root_future.get()), kReferenceTime, 3650, 0));
+    ASSERT_TRUE(ASN1_TIME_adj(X509_getm_notAfter(root_future.get()), kReferenceTime, 7300, 0));
+    ASSERT_TRUE(X509_sign(root_future.get(), root_key.get(), EVP_sha256()));
+    EXPECT_EQ(X509_V_ERR_CERT_NOT_YET_VALID,
+              Verify(leaf.get(), {root_future.get()}, {int_new.get()}, {}, kFlag));
+    // A skipped anchor does not change the error of a chain that fails for another reason.
+    EXPECT_EQ(X509_V_ERR_CERT_HAS_EXPIRED,
+              Verify(leaf.get(), {root.get(), int_old.get()}, {int_old.get()}, {}, kFlag));
   }
   // X509_V_FLAG_NO_CHECK_TIME wins.
   EXPECT_EQ(X509_V_OK, Verify(leaf.get(), {root_old.get()}, {int_new.get()}, {},

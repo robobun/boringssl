@@ -3361,10 +3361,11 @@ OPENSSL_EXPORT int X509_VERIFY_PARAM_set1(X509_VERIFY_PARAM *to,
 // whose validity period does not cover the verification time as if it were
 // not there, so it can neither anchor a chain nor shadow a currently-valid
 // certificate for the same issuer supplied by the peer or elsewhere in the
-// store. A chain that could only have been built through such a certificate
-// then fails as untrusted (e.g. `X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY`)
-// rather than `X509_V_ERR_CERT_HAS_EXPIRED`. Untrusted (peer) certificates are
-// unaffected. Has no effect with `X509_V_FLAG_NO_CHECK_TIME`.
+// store. A chain that reaches no usable anchor after such a certificate was
+// passed over still reports `X509_V_ERR_CERT_HAS_EXPIRED` (or
+// `X509_V_ERR_CERT_NOT_YET_VALID`) rather than an unknown-issuer error.
+// Untrusted (peer) certificates are unaffected. Has no effect with
+// `X509_V_FLAG_NO_CHECK_TIME`.
 #define X509_V_FLAG_IGNORE_EXPIRED_TRUST_ANCHORS 0x2000000
 
 // X509_VERIFY_PARAM_set_flags enables all values in `flags` in `param`'s
