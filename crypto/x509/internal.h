@@ -389,6 +389,9 @@ class X509LazyCertSet : public x509_lazy_cert_set_st,
 
   // Get returns the `idx`th certificate, parsing it on first call.
   X509 *Get(size_t idx);
+  const CRYPTO_BUFFER *GetDER(size_t idx) const {
+    return idx < certs_.size() ? certs_[idx].der.get() : nullptr;
+  }
 
   // AddMatchesToStore parses every certificate whose subject is `name` and adds
   // it to `store`. It returns false on error; no match is not an error.

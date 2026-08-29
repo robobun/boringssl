@@ -2835,6 +2835,17 @@ OPENSSL_EXPORT X509_LAZY_CERT_SET *X509_LAZY_CERT_SET_new(
 OPENSSL_EXPORT X509_LAZY_CERT_SET *X509_LAZY_CERT_SET_new_static(
     const uint8_t *const *certs, const size_t *cert_lens, size_t num_certs);
 
+// X509_LAZY_CERT_SET_can_index returns one if `der` is shaped enough like a
+// Certificate for `X509_LAZY_CERT_SET_new` to index it (which otherwise fails
+// the whole set), and zero otherwise. It does not check that the certificate
+// fully parses.
+OPENSSL_EXPORT int X509_LAZY_CERT_SET_can_index(const uint8_t *der, size_t len);
+
+// X509_LAZY_CERT_SET_get0_der returns the DER of the `idx`th certificate in
+// `set` without parsing it, or NULL if `idx` is out of range.
+OPENSSL_EXPORT const CRYPTO_BUFFER *X509_LAZY_CERT_SET_get0_der(
+    const X509_LAZY_CERT_SET *set, size_t idx);
+
 // X509_LAZY_CERT_SET_up_ref adds one to the reference count of `set` and
 // returns one.
 OPENSSL_EXPORT int X509_LAZY_CERT_SET_up_ref(X509_LAZY_CERT_SET *set);

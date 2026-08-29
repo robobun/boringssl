@@ -11948,11 +11948,20 @@ TEST(X509Test, LazyCertSet) {
                                          {intermediate.get()}));
   }
 
+  // The DER is retrievable without parsing.
+  const CRYPTO_BUFFER *der1 = X509_LAZY_CERT_SET_get0_der(set.get(), 1);
+  ASSERT_TRUE(der1);
+  EXPECT_EQ(Bytes(ders[1]), Bytes(CRYPTO_BUFFER_data(der1), CRYPTO_BUFFER_len(der1)));
+  EXPECT_EQ(nullptr, X509_LAZY_CERT_SET_get0_der(set.get(), 3));
+  EXPECT_TRUE(X509_LAZY_CERT_SET_can_index(ders[0].data(), ders[0].size()));
+  EXPECT_FALSE(X509_LAZY_CERT_SET_can_index(ders[0].data(), ders[0].size() - 1));
+
   // Malformed input is rejected up front rather than at lookup time.
   static const uint8_t kTruncated[] = {0x30, 0x03, 0x30, 0x01};
   const uint8_t *bad_ptr = kTruncated;
   size_t bad_len = sizeof(kTruncated);
   EXPECT_FALSE(X509_LAZY_CERT_SET_new_static(&bad_ptr, &bad_len, 1));
+  EXPECT_FALSE(X509_LAZY_CERT_SET_can_index(kTruncated, sizeof(kTruncated)));
   ERR_clear_error();
 }
 

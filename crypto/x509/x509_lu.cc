@@ -686,6 +686,19 @@ void X509_LAZY_CERT_SET_free(X509_LAZY_CERT_SET *set) {
   }
 }
 
+int X509_LAZY_CERT_SET_can_index(const uint8_t *der, size_t len) {
+  CBS cbs, subject;
+  CBS_init(&cbs, der, len);
+  Array<uint8_t> canon;
+  return x509_cert_subject(cbs, &subject) &&
+         x509_name_canon_from_der(&subject, &canon);
+}
+
+const CRYPTO_BUFFER *X509_LAZY_CERT_SET_get0_der(const X509_LAZY_CERT_SET *set,
+                                                 size_t idx) {
+  return FromOpaque(set)->GetDER(idx);
+}
+
 size_t X509_LAZY_CERT_SET_num(const X509_LAZY_CERT_SET *set) {
   return FromOpaque(set)->size();
 }
