@@ -458,6 +458,60 @@ static const struct pkcs1_sig_prefix kPKCS1SigPrefixes[] = {
         {0x30, 0x51, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03,
          0x04, 0x02, 0x03, 0x05, 0x00, 0x04, 0x40},
     },
+    // The rows below are the other fixed-length digests this fork exports as
+    // `EVP_MD`s. Upstream has no rows for them: there `RSA_sign` fails and
+    // `RSA_verify` rejects a valid signature. The encodings are OpenSSL's
+    // (RFC 8017, section 9.2, NULL parameters present). MD4 has no row on
+    // purpose.
+    {
+        NID_sha512_224,
+        SHA512_224_DIGEST_LENGTH,
+        19,
+        {0x30, 0x2d, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03,
+         0x04, 0x02, 0x05, 0x05, 0x00, 0x04, 0x1c},
+    },
+    {
+        NID_sha512_256,
+        SHA512_256_DIGEST_LENGTH,
+        19,
+        {0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03,
+         0x04, 0x02, 0x06, 0x05, 0x00, 0x04, 0x20},
+    },
+    {
+        NID_sha3_224,
+        28,
+        19,
+        {0x30, 0x2d, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03,
+         0x04, 0x02, 0x07, 0x05, 0x00, 0x04, 0x1c},
+    },
+    {
+        NID_sha3_256,
+        32,
+        19,
+        {0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03,
+         0x04, 0x02, 0x08, 0x05, 0x00, 0x04, 0x20},
+    },
+    {
+        NID_sha3_384,
+        48,
+        19,
+        {0x30, 0x41, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03,
+         0x04, 0x02, 0x09, 0x05, 0x00, 0x04, 0x30},
+    },
+    {
+        NID_sha3_512,
+        64,
+        19,
+        {0x30, 0x51, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03,
+         0x04, 0x02, 0x0a, 0x05, 0x00, 0x04, 0x40},
+    },
+    {
+        NID_ripemd160,
+        20,
+        15,
+        {0x30, 0x21, 0x30, 0x09, 0x06, 0x05, 0x2b, 0x24, 0x03, 0x02, 0x01, 0x05,
+         0x00, 0x04, 0x14},
+    },
     {
         NID_undef,
         0,
@@ -493,13 +547,13 @@ static int rsa_check_digest_size(int hash_nid, size_t digest_len) {
 int RSA_add_pkcs1_prefix(uint8_t **out_msg, size_t *out_msg_len,
                          int *is_alloced, int hash_nid, const uint8_t *digest,
                          size_t digest_len) {
-  if (!rsa_check_digest_size(hash_nid, digest_len)) {
-    return 0;
-  }
-
+  // Upstream calls `rsa_check_digest_size` first and then walks the table a
+  // second time. This checks the length where it finds the row instead.
   if (hash_nid == NID_md5_sha1) {
-    // The length should already have been checked.
-    assert(digest_len == SSL_SIG_LENGTH);
+    if (digest_len != SSL_SIG_LENGTH) {
+      OPENSSL_PUT_ERROR(RSA, RSA_R_INVALID_MESSAGE_LENGTH);
+      return 0;
+    }
     *out_msg = (uint8_t *)digest;
     *out_msg_len = digest_len;
     *is_alloced = 0;
@@ -512,8 +566,10 @@ int RSA_add_pkcs1_prefix(uint8_t **out_msg, size_t *out_msg_len,
       continue;
     }
 
-    // The length should already have been checked.
-    assert(digest_len == sig_prefix->hash_len);
+    if (digest_len != sig_prefix->hash_len) {
+      OPENSSL_PUT_ERROR(RSA, RSA_R_INVALID_MESSAGE_LENGTH);
+      return 0;
+    }
     const uint8_t *prefix = sig_prefix->bytes;
     size_t prefix_len = sig_prefix->len;
     size_t signed_msg_len = prefix_len + digest_len;

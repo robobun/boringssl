@@ -421,6 +421,18 @@ static int pkey_ec_derive(EvpPkeyCtx *ctx, uint8_t *key, size_t *keylen) {
   return 1;
 }
 
+// pkey_ec_is_extra_md returns whether `md_type` is one of the other
+// fixed-length digests this fork exports as `EVP_MD`s. Upstream refuses them,
+// although `pkey_ec_sign` and `pkey_ec_verify` pass the digest to `ECDSA_sign`
+// and `ECDSA_verify` and never read `dctx->md`. MD4 is left out on purpose.
+static bool pkey_ec_is_extra_md(int md_type) {
+  return md_type == NID_sha512_224 || md_type == NID_sha512_256 ||
+         md_type == NID_sha3_224 || md_type == NID_sha3_256 ||
+         md_type == NID_sha3_384 || md_type == NID_sha3_512 ||
+         md_type == NID_ripemd160 || md_type == NID_md5 ||
+         md_type == NID_md5_sha1;
+}
+
 static int pkey_ec_ctrl(EvpPkeyCtx *ctx, int type, int p1, void *p2) {
   EC_PKEY_CTX *dctx = reinterpret_cast<EC_PKEY_CTX *>(ctx->data);
 
@@ -430,7 +442,7 @@ static int pkey_ec_ctrl(EvpPkeyCtx *ctx, int type, int p1, void *p2) {
       int md_type = EVP_MD_type(md);
       if (md_type != NID_sha1 && md_type != NID_sha224 &&
           md_type != NID_sha256 && md_type != NID_sha384 &&
-          md_type != NID_sha512) {
+          md_type != NID_sha512 && !pkey_ec_is_extra_md(md_type)) {
         OPENSSL_PUT_ERROR(EVP, EVP_R_INVALID_DIGEST_TYPE);
         return 0;
       }
